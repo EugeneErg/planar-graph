@@ -155,7 +155,8 @@ final readonly class CoordinateService
         // тоже плоская, только кривее.
         $all = $this->motion->getEdges($this->getNeighbours(array_merge([$outerEdge], $edges)));
 
-        return $this->compareScores($this->getScore($coordinates, $all), $this->getScore($guess, $all)) < 0
+        // Сравнивается самый узкий просвет: вопрос в том, не слиплось ли что-то.
+        return ($this->getScore($coordinates, $all)[0] ?? .0) < ($this->getScore($guess, $all)[0] ?? .0)
             ? $guess
             : $coordinates;
     }
