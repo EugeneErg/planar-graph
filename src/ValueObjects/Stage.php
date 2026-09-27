@@ -16,12 +16,18 @@ final readonly class Stage
     /**
      * @param array<int, int[]> $groups номер группы => её вершины
      * @param int[] $highlight
+     * @param array<int, int> $flows вершина => от какой вершины к ней пришло;
+     *                               по этим связям краска и переползает
+     * @param array<int, int[]> $produced что шаг сделал из групп: обходы граней,
+     *                                    получившихся на склейке
      */
     public function __construct(
         public StageKind $kind,
         public string $caption,
         public array $groups = [],
         public array $highlight = [],
+        public array $flows = [],
+        public array $produced = [],
     ) {
     }
 

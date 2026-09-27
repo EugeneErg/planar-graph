@@ -6,8 +6,10 @@ namespace EugeneErg\Graphs\Services;
 
 use EugeneErg\Graphs\Aggregates\Canvas;
 use EugeneErg\Graphs\Aggregates\SliceAggregate;
+use EugeneErg\Graphs\Aggregates\Trace;
 use EugeneErg\Graphs\ValueObjects\DirectionGraph;
 use EugeneErg\Graphs\ValueObjects\Intersection;
+use EugeneErg\Graphs\ValueObjects\StageKind;
 
 readonly class IntersectionService
 {
@@ -26,8 +28,9 @@ readonly class IntersectionService
         array $path,
         array $outerVertexes,
         SliceAggregate $slice,
+        ?Trace $trace = null,
     ): array {
-        $intersections = $this->getIntersections($branch, $path, $outerVertexes);
+        $intersections = $this->getIntersections($branch, $path, $outerVertexes, $trace);
         $matrix = $this->getIntersectionMatrix($path, $intersections);
         $defined = [];
         $undefined = [];
@@ -70,6 +73,21 @@ readonly class IntersectionService
             }
         }
 
+        // Каждый висящий кусок разложен по сторонам. То, что легло наружу,
+        // внутрь обхода уже не попадёт — и на картинке уезжает на внешний
+        // круг. В этом и состоит проверка: два несовместимых внутрь не
+        // помещаются, и если развести их не удалось, граф не планарен.
+        foreach ($intersections as $intersection) {
+            if ($intersection->isOuter) {
+                $trace?->add(
+                    StageKind::Outside,
+                    sprintf('Снаружи обхода: %s', implode(' - ', $intersection->vertexes)),
+                    [],
+                    $intersection->vertexes,
+                );
+            }
+        }
+
         return $result;
     }
 
@@ -101,10 +119,21 @@ readonly class IntersectionService
      * @param array<int, bool> $outerVertexes
      * @return Intersection[]
      */
-    private function getIntersections(DirectionGraph $branch, array $path, array $outerVertexes): array
+    private function getIntersections(DirectionGraph $branch, array $path, array $outerVertexes, ?Trace $trace = null): array
     {
         $canvas = new Canvas($branch);
         $this->canvasService->setPixels($canvas, $path, 1);
+        // Обход заперт целиком: дальше заливка из каждого его соседа упрётся
+        // в него и накроет ровно один кусок, висящий на обходе. По тому,
+        // достаёт ли этот кусок до внешних вершин, и решают, внутри он или
+        // снаружи. Это тот же приём, что и с точкой сочленения, только
+        // запирают не одну вершину, а весь обход.
+        $trace?->add(
+            StageKind::Block,
+            sprintf('Запираем обход: %s', implode(' - ', $path)),
+            [],
+            $path,
+        );
         $color = 1;
         $colors = [];
         $intersections = [];
@@ -122,7 +151,7 @@ readonly class IntersectionService
                 }
 
                 $color++;
-                $colors[$color] = $this->canvasService->fill($canvas, $vertexB, $color);
+                $colors[$color] = $this->canvasService->fill($canvas, $vertexB, $color, $trace);
             }
         }
 

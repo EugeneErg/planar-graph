@@ -43,7 +43,13 @@ final class StoryServiceTest extends AbstractTestCase
         }
 
         foreach (StageKind::cases() as $kind) {
-            if ($kind === StageKind::Order) {
+            // «Порядок полей» и «найдена ветвь» своего кадра не получают.
+            // Порядок виден с первого разреза: поле сразу ложится туда,
+            // откуда его и возьмут. А находка ветви — пометка в журнале:
+            // алгоритм записывает ветви на обратном ходу рекурсии, и рассказ
+            // разворачивает их в цикл «запер — залил — вырезал», где каждая
+            // и показывается.
+            if ($kind === StageKind::Order || $kind === StageKind::Branch || self::isArcStage($kind)) {
                 continue;
             }
 
@@ -87,7 +93,8 @@ final class StoryServiceTest extends AbstractTestCase
         return match ($stage->kind) {
             StageKind::Components, StageKind::Branches => count(array_filter($stage->groups)) < 2,
             StageKind::ArticulationVertexes, StageKind::OuterFace => $stage->highlight === [],
-            StageKind::Order => true,
+            StageKind::Order, StageKind::Branch => true,
+            StageKind::Arc, StageKind::Postpone, StageKind::Absorb, StageKind::Merge => true,
             default => false,
         };
     }
@@ -99,16 +106,39 @@ final class StoryServiceTest extends AbstractTestCase
      */
     public function testWholeAlgorithmIsTold(): void
     {
-        [$trace] = $this->trace(self::getSmallTree());
+        // Ни на одном графе не встречается всё сразу: на связном нечего
+        // делить на куски, на двусвязном — на ветви, а на графе без
+        // несовместимых кусков ничего не выносят наружу. Поэтому этапы
+        // собираются со всех фикстур.
         $kinds = [];
 
-        foreach ($trace->getStages() as $stage) {
-            $kinds[$stage->kind->value] = true;
+        foreach (self::getGraphs() as [$connections]) {
+            [$trace] = $this->trace($connections);
+
+            foreach ($trace->getStages() as $stage) {
+                $kinds[$stage->kind->value] = true;
+            }
         }
 
         foreach (StageKind::cases() as $kind) {
+            // Объединение отложенных — случай, когда укладывать больше нечего.
+            // Ни на одной фикстуре он не встречается: отложенное всякий раз
+            // накрывает обычная дуга.
+            if ($kind === StageKind::Merge) {
+                continue;
+            }
+
             self::assertArrayHasKey($kind->value, $kinds, sprintf('Не рассказан этап «%s».', $kind->value));
         }
+    }
+
+    /**
+     * Как ложатся дуги, рассказывает новый конвейер (`InstructionService`),
+     * а не этот.
+     */
+    private static function isArcStage(StageKind $kind): bool
+    {
+        return in_array($kind, [StageKind::Arc, StageKind::Postpone, StageKind::Absorb, StageKind::Merge], true);
     }
 
     /**
@@ -347,13 +377,14 @@ final class StoryServiceTest extends AbstractTestCase
 
     /**
      * Точка сочленения принадлежит нескольким ветвям, поэтому при разрезании
-     * она раздваивается: в кадре появляются её копии.
+     * она раздваивается: в кадре появляются её копии. Ветви отрезают по одной,
+     * поэтому смотреть надо на последний кадр разреза — когда отрезаны все.
      */
     public function testArticulationVertexIsDuplicatedWhenBranchesAreCut(): void
     {
         [$trace, $frames, $connections] = $this->trace(self::getSmallTree());
         $scenes = (new StoryService())->build($trace, $frames, $connections);
-        $spots = $this->spotsOf($this->findScene($scenes, StageKind::Branches));
+        $spots = $this->spotsOf($this->findLastScene($scenes, StageKind::Branches));
 
         self::assertSame(2, $spots[4] ?? 0, 'Вершина 4 лежит в двух ветвях.');
         self::assertSame(1, $spots[0] ?? 0, 'Обычная вершина не раздваивается.');
@@ -432,6 +463,10 @@ final class StoryServiceTest extends AbstractTestCase
      * один и тот же во всех кадрах. Отрезанный кусок отделяется от графа
      * на глазах, потому что до разреза он лежит поверх него.
      *
+     * Единственное, что в графе прибавляется, — связки: их добавляет склейка,
+     * чтобы односвязный граф стал двусвязным. Связка появляется на своей
+     * склейке, рисуется пунктиром и больше не исчезает.
+     *
      * @param true[][] $connections
      */
     #[DataProvider('getGraphs')]
@@ -442,16 +477,40 @@ final class StoryServiceTest extends AbstractTestCase
         $vertexes = array_keys($scenes[0]->vertexes);
         $edges = array_keys($scenes[0]->edges);
         sort($vertexes);
-        sort($edges);
+        $tied = [];
 
         foreach ($scenes as $number => $scene) {
             $sceneVertexes = array_keys($scene->vertexes);
-            $sceneEdges = array_keys($scene->edges);
             sort($sceneVertexes);
-            sort($sceneEdges);
 
             self::assertSame($vertexes, $sceneVertexes, sprintf('В кадре %d состав вершин другой.', $number));
-            self::assertSame($edges, $sceneEdges, sprintf('В кадре %d состав рёбер другой.', $number));
+            self::assertSame(
+                [],
+                array_diff($edges, array_keys($scene->edges)),
+                sprintf('В кадре %d пропало ребро.', $number),
+            );
+
+            foreach (array_diff(array_keys($scene->edges), $edges) as $key) {
+                self::assertArrayHasKey(
+                    $key,
+                    $scene->ties,
+                    sprintf('В кадре %d из воздуха возникло ребро %s.', $number, $key),
+                );
+                self::assertSame(
+                    $scene->kind === StageKind::Tie || isset($tied[$key]),
+                    true,
+                    sprintf('Связка %s появилась не на склейке.', $key),
+                );
+                $tied[$key] = true;
+            }
+
+            foreach (array_keys($tied) as $key) {
+                self::assertArrayHasKey(
+                    $key,
+                    $scene->edges,
+                    sprintf('В кадре %d пропала связка %s.', $number, $key),
+                );
+            }
         }
     }
 
@@ -480,6 +539,132 @@ final class StoryServiceTest extends AbstractTestCase
     }
 
     /**
+     * Место на столе есть у каждого, кому оно назначено, и занято оно одним.
+     *
+     * Мест на столе ровно столько, сколько их раздали. Если нумеровать куски,
+     * а не места, номеров выйдет больше: одно место занимает целая цепочка —
+     * ветвь, а за ней всё, что от неё остаётся после каждого разреза.
+     * Тогда последним места не хватит, и они лягут в начало координат поверх
+     * чужих полей.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testEveryPieceHasAPlaceOfItsOwn(array $connections): void
+    {
+        [$trace, , $links] = $this->trace($connections);
+        $plan = (new StoryService())->getCutPlan($trace, $links);
+
+        self::assertNotSame([], $plan->getState(0)['live'], 'В первом кадре лежит хотя бы сам граф.');
+
+        for ($number = 0; $number <= $plan->getLastState(); $number++) {
+            $taken = [];
+
+            foreach ($plan->getState($number)['live'] as $id) {
+                $place = $plan->getState($number)['places'][$id];
+
+                if ($place === -1) {
+                    continue;
+                }
+
+                $table = $plan->getTable($id);
+
+                self::assertLessThan(
+                    $plan->getSlotCount($table),
+                    $place,
+                    sprintf('В кадре %d куску %d досталось место %d, которого на столе %d нет.', $number, $id, $place, $table),
+                );
+                self::assertArrayNotHasKey(
+                    $table . ':' . $place,
+                    $taken,
+                    sprintf('В кадре %d куски %d и %d стоят на одном месте.', $number, $taken[$table . ':' . $place] ?? 0, $id),
+                );
+
+                $taken[$table . ':' . $place] = $id;
+            }
+        }
+    }
+
+    /**
+     * Куски не налезают друг на друга ни в одном кадре: что лежит отдельно,
+     * то и выглядит отдельно. Кусок здесь — то, что связано на картинке,
+     * поэтому ещё не отрезанная копия, лежащая поверх оригинала, считается
+     * с ним заодно.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testPiecesDoNotLieOnTopOfEachOther(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $geometry = $this->getGeometryService();
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+
+        self::assertNotSame([], $scenes, 'Рассказ не бывает пустым.');
+
+        foreach ($scenes as $number => $scene) {
+            $edges = array_values($scene->edges);
+            $pieces = self::piecesOf($edges);
+            $count = count($edges);
+
+            for ($i = 0; $i < $count; $i++) {
+                for ($j = $i + 1; $j < $count; $j++) {
+                    if ($pieces[$i] === $pieces[$j]) {
+                        continue;
+                    }
+
+                    self::assertFalse(
+                        $geometry->segmentsIntersect($edges[$i][0], $edges[$i][1], $edges[$j][0], $edges[$j][1]),
+                        sprintf('В кадре %d два разных куска налезли друг на друга.', $number),
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Разбивает рёбра кадра на куски: ребро с ребром в одном куске, если они
+     * сходятся концами в одной точке.
+     *
+     * @param array<int, array{Point2D, Point2D}> $edges
+     *
+     * @return int[] ребро => номер куска
+     */
+    private static function piecesOf(array $edges): array
+    {
+        $pieces = array_keys($edges);
+        $find = static function (int $edge) use (&$pieces): int {
+            while ($pieces[$edge] !== $edge) {
+                $pieces[$edge] = $pieces[$pieces[$edge]];
+                $edge = $pieces[$edge];
+            }
+
+            return $edge;
+        };
+        $same = static fn (Point2D $one, Point2D $two): bool => abs($one->x - $two->x) < 1e-9 && abs($one->y - $two->y) < 1e-9;
+        $count = count($edges);
+
+        for ($i = 0; $i < $count; $i++) {
+            for ($j = $i + 1; $j < $count; $j++) {
+                if (
+                    $same($edges[$i][0], $edges[$j][0]) || $same($edges[$i][0], $edges[$j][1])
+                    || $same($edges[$i][1], $edges[$j][0]) || $same($edges[$i][1], $edges[$j][1])
+                ) {
+                    $pieces[$find($i)] = $find($j);
+                }
+            }
+        }
+
+        $result = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $result[$i] = $find($i);
+        }
+
+        return $result;
+    }
+
+    /**
      * У каждого несвязного куска свой стол: нарезка одного не лезет на другой,
      * и собираются они тоже врозь.
      *
@@ -499,11 +684,14 @@ final class StoryServiceTest extends AbstractTestCase
                 continue;
             }
 
-            [$leftA, $rightA] = $this->boundsOf($scene, $first);
-            [$leftB, $rightB] = $this->boundsOf($scene, $second);
+            // Куски раскладываются вокруг центрального, поэтому врозь они
+            // не обязательно слева и справа: проверяется, что их прямоугольники
+            // не налезают, в какую бы сторону кусок ни уехал.
+            [$leftA, $rightA, $topA, $bottomA] = $this->boundsOf($scene, $first);
+            [$leftB, $rightB, $topB, $bottomB] = $this->boundsOf($scene, $second);
 
             self::assertTrue(
-                $rightA < $leftB || $rightB < $leftA,
+                $rightA < $leftB || $rightB < $leftA || $bottomA < $topB || $bottomB < $topA,
                 sprintf('В кадре %d куски налезли друг на друга.', $number),
             );
         }
@@ -562,42 +750,51 @@ final class StoryServiceTest extends AbstractTestCase
     }
 
     /**
-     * Выделение держится до самого действия: точки сочленения обведены
-     * с момента, как их нашли, и до момента, когда по ним разрезали.
+     * За кольцом сразу идёт тот разрез, ради которого его зажгли: обведена
+     * точка сочленения — следующим кадром по ней и режут, и она раздваивается.
+     * Обвести разом все точки, а потом разом всё разрезать — светофор, а
+     * не действие.
+     *
+     * @param true[][] $connections
      */
-    public function testMarkStaysUntilTheCutItWasMadeFor(): void
+    #[DataProvider('getGraphs')]
+    public function testEveryRingIsFollowedByItsCut(array $connections): void
     {
-        [$trace, $frames, $connections] = $this->trace(self::getSmallTree());
-        $scenes = (new StoryService())->build($trace, $frames, $connections);
-        $from = null;
-        $to = null;
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+
+        self::assertNotSame([], $scenes, 'Рассказ не бывает пустым.');
 
         foreach ($scenes as $number => $scene) {
-            if ($scene->kind === StageKind::ArticulationVertexes) {
-                $from ??= $number;
+            if ($scene->kind !== StageKind::ArticulationVertexes) {
+                continue;
             }
 
-            if ($scene->kind === StageKind::Branches) {
-                $to = $number;
-            }
-        }
+            $next = $scenes[$number + 1] ?? null;
 
-        self::assertNotNull($from);
-        self::assertNotNull($to);
-        self::assertGreaterThan($from, $to, 'Между выделением и разрезом должен быть поиск ветвей.');
-
-        for ($i = $from; $i <= $to; $i++) {
-            $marked = [];
-
-            foreach (array_keys($scenes[$i]->highlight) as $key) {
-                $marked[Scene::vertexOf($key)] = true;
+            // Кадр выделения идёт дважды подряд: сначала кольцо держится
+            // неподвижно, и только потом начинается движение.
+            if ($next !== null && $next->kind === $scene->kind && $next->highlight === $scene->highlight) {
+                continue;
             }
 
-            foreach ([4, 5, 6] as $vertex) {
-                self::assertArrayHasKey(
-                    $vertex,
-                    $marked,
-                    sprintf('В кадре %d потерялось выделение точки сочленения %d.', $i, $vertex),
+            self::assertNotNull($next, sprintf('За кольцом в кадре %d ничего не следует.', $number));
+            self::assertSame(
+                StageKind::Branches,
+                $next->kind,
+                sprintf('За кольцом в кадре %d идёт не разрез.', $number),
+            );
+
+            $was = $this->spotsOf($scene);
+            $now = $this->spotsOf($next);
+
+            foreach (array_keys($scene->highlight) as $key) {
+                $vertex = Scene::vertexOf($key);
+
+                self::assertGreaterThan(
+                    $was[$vertex] ?? 0,
+                    $now[$vertex] ?? 0,
+                    sprintf('Обвели вершину %d, а разрезали не по ней.', $vertex),
                 );
             }
         }
@@ -648,6 +845,322 @@ final class StoryServiceTest extends AbstractTestCase
                 self::assertArrayHasKey(self::pointKey($to), $points);
             }
         }
+    }
+
+    /**
+     * В укладку поле встраивается по одному за кадр. На одном шаге построения
+     * может сойтись сразу несколько готовых полей — поле, все вершины которого
+     * уже лежат, готово вместе с тем, кто уложил последнюю. Показывать их разом
+     * нельзя: непонятно, что откуда взялось.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testLayoutGrowsByOneFieldAtATime(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+
+        self::assertNotSame([], $scenes, 'Рассказ не бывает пустым.');
+
+        foreach ($scenes as $number => $scene) {
+            if ($scene->kind !== StageKind::Build || ! isset($scenes[$number - 1])) {
+                continue;
+            }
+
+            self::assertLessThanOrEqual(
+                1,
+                self::movedPieces($scenes[$number - 1], $scene),
+                sprintf('В кадре %d в укладку встроилось больше одного поля.', $number),
+            );
+        }
+    }
+
+    /**
+     * Куски отрезают по одному: за кадр уезжает одна часть, а с места сходит
+     * только она и остаток, который перераспределяется по своему кругу.
+     * Разом отпустить все нельзя — глаз не успевает за тем, как полграфа
+     * разлетается в стороны.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testPartsAreCutOneAtATime(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+
+        self::assertNotSame([], $scenes, 'Рассказ не бывает пустым.');
+
+        foreach ($scenes as $number => $scene) {
+            $cutting = $scene->kind === StageKind::Branches || $scene->kind === StageKind::Components
+                || $scene->kind === StageKind::Field;
+
+            if (! $cutting || ! isset($scenes[$number - 1])) {
+                continue;
+            }
+
+            self::assertLessThanOrEqual(
+                2,
+                self::movedPieces($scenes[$number - 1], $scene),
+                sprintf('В кадре %d разъехалось больше одной части за раз.', $number),
+            );
+        }
+    }
+
+    /**
+     * Укладка растёт от куска к куску, а не островками: каждое следующее поле
+     * держится за уже уложенное. Островков не больше, чем несвязных кусков
+     * в самом графе, — иначе построение начинается посреди пустоты, например
+     * с перемычки, оба конца которой попали на внешнюю грань.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testLayoutGrowsPieceByPiece(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+        $allowed = self::countParts($links);
+        $islands = [];
+
+        foreach ($scenes as $number => $scene) {
+            if ($scene->kind !== StageKind::Build || ! isset($scenes[$number - 1])) {
+                continue;
+            }
+
+            $arrived = [];
+
+            foreach ($scene->vertexes as $key => $point) {
+                $was = $scenes[$number - 1]->vertexes[$key] ?? null;
+
+                if ($was !== null && (abs($was->x - $point->x) > 1e-9 || abs($was->y - $point->y) > 1e-9)) {
+                    $arrived[self::pointKey($point)] = true;
+                }
+            }
+
+            if ($arrived === []) {
+                continue;
+            }
+
+            $merged = $arrived;
+
+            foreach ($islands as $island => $points) {
+                if (array_intersect_key($points, $arrived) !== []) {
+                    $merged += $points;
+                    unset($islands[$island]);
+                }
+            }
+
+            $islands[] = $merged;
+
+            self::assertLessThanOrEqual(
+                $allowed,
+                count($islands),
+                sprintf('В кадре %d поле легло в стороне от уложенного.', $number),
+            );
+        }
+
+        // Граф из одного поля собирается, никуда не переезжая: оно уже лежит
+        // там, где ему и быть. Островков тогда нет вовсе — и это не ошибка.
+        self::assertLessThanOrEqual($allowed, count($islands));
+    }
+
+    /**
+     * Поля встраиваются в том порядке, в каком их строил алгоритм.
+     *
+     * Шаг построения прокладывает обход и вместе с ним свои рёбра; поле готово,
+     * когда проложено последнее его ребро. В этом порядке поля и лежат на
+     * кольце — их оттуда и забирают. Отстать от очереди поле может только
+     * по делу: пока ему не за что зацепиться, оно ждёт, иначе легло бы
+     * островком. А вот обогнать того, кто готов раньше и уже держится за
+     * уложенное, нельзя.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testFieldsAreBuiltInTheOrderTheAlgorithmLaidThem(array $connections): void
+    {
+        [$trace, , $links] = $this->trace($connections);
+        $plan = (new StoryService())->getCutPlan($trace, $links);
+        $steps = self::edgeSteps($trace);
+        $tables = [];
+
+        foreach ($plan->getState($plan->getLastState())['live'] as $id) {
+            $piece = $plan->getCutout($id)->piece;
+            $rank = -1;
+
+            foreach ($piece->edges as [$vertexA, $vertexB]) {
+                $rank = max($rank, $steps[Scene::edgeName($vertexA, $vertexB)] ?? -1);
+            }
+
+            $tables[$plan->getTable($id)][$plan->getPlace($id)] = ['rank' => $rank, 'vertexes' => $piece->vertexes];
+        }
+
+        foreach ($tables as $table => $pieces) {
+            ksort($pieces);
+            $built = [];
+            $waiting = $pieces;
+            $faces = array_filter($pieces, static fn (array $item): bool => count($item['vertexes']) > 2);
+            $first = reset($pieces);
+
+            if ($faces !== [] && $first !== false) {
+                self::assertGreaterThan(
+                    2,
+                    count($first['vertexes']),
+                    sprintf('Стол %d открывает перемычка, а не грань.', $table),
+                );
+            }
+
+            foreach ($pieces as $place => $piece) {
+                unset($waiting[$place]);
+
+                foreach ($waiting as $other) {
+                    if ($other['rank'] >= $piece['rank'] || $built === []) {
+                        continue;
+                    }
+
+                    self::assertSame(
+                        [],
+                        array_intersect($other['vertexes'], array_keys($built)),
+                        sprintf('На столе %d поле с места %d обогнало то, что готово раньше и уже держится за уложенное.', $table, $place),
+                    );
+                }
+
+                foreach ($piece['vertexes'] as $vertex) {
+                    $built[$vertex] = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * Каким по счёту шагом построения алгоритм проложил каждое ребро.
+     *
+     * @return array<string, int>
+     */
+    private static function edgeSteps(Trace $trace): array
+    {
+        $result = [];
+        $step = 0;
+
+        foreach ($trace->getStages() as $stage) {
+            if ($stage->kind !== StageKind::Build) {
+                continue;
+            }
+
+            $walk = $stage->groups[1] ?? [];
+            $count = count($walk);
+
+            for ($number = 1; $number < $count; $number++) {
+                $result[Scene::edgeName($walk[$number - 1], $walk[$number])] ??= $step;
+            }
+
+            $step++;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Заливка идёт по связям: краска ползёт от уже закрашенной вершины
+     * к соседней и доходит до неё ровно к тому кадру, в котором та
+     * закрашивается. Иначе видно только, что точки меняют цвет, а кто кого
+     * закрасил — нет.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testPaintCrawlsAlongEdges(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+        $flows = 0;
+
+        foreach ($scenes as $number => $scene) {
+            foreach ($scene->flows as $key => [$from, $group]) {
+                $flows++;
+
+                self::assertArrayHasKey($key, $scene->edges, sprintf('В кадре %d краска ползёт по ребру, которого нет.', $number));
+                self::assertSame(
+                    $group,
+                    $scenes[$number - 1]->groups[$from] ?? null,
+                    sprintf('В кадре %d краска пошла от незакрашенной вершины.', $number),
+                );
+                self::assertSame(
+                    $group,
+                    $scene->groups[$key] ?? null,
+                    sprintf('В кадре %d краска дошла, а ребро осталось незакрашенным.', $number),
+                );
+            }
+        }
+
+        self::assertGreaterThan(0, $flows, 'Заливка должна хоть раз перетечь по связи.');
+    }
+
+    /**
+     * @param true[][] $connections
+     */
+    private static function countParts(array $connections): int
+    {
+        $parts = [];
+        $result = 0;
+
+        foreach (array_keys($connections) as $vertex) {
+            if (isset($parts[$vertex])) {
+                continue;
+            }
+
+            $result++;
+            $stack = [$vertex];
+            $parts[$vertex] = true;
+
+            while ($stack !== []) {
+                $current = array_pop($stack);
+
+                foreach (array_keys($connections[$current] ?? []) as $next) {
+                    if (! isset($parts[$next])) {
+                        $parts[$next] = true;
+                        $stack[] = $next;
+                    }
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Сколько кусков сошло с места за переход. Куски считаются по кадру до
+     * перехода: приехавшее сливается с тем, к чему приехало, и по кадру после
+     * уже не разобрать, сколько всего ехало.
+     */
+    private static function movedPieces(Scene $before, Scene $after): int
+    {
+        $edges = array_values($before->edges);
+        $pieces = self::piecesOf($edges);
+        $at = [];
+
+        foreach ($edges as $number => [$from, $to]) {
+            $at[self::pointKey($from)] = $pieces[$number];
+            $at[self::pointKey($to)] = $pieces[$number];
+        }
+
+        $moved = [];
+
+        foreach ($after->vertexes as $key => $point) {
+            $was = $before->vertexes[$key] ?? null;
+
+            if ($was === null || (abs($was->x - $point->x) < 1e-9 && abs($was->y - $point->y) < 1e-9)) {
+                continue;
+            }
+
+            // Одинокая вершина сама себе кусок: рёбер, по которым её можно
+            // было бы к чему-то отнести, у неё нет.
+            $moved[$at[self::pointKey($was)] ?? 'v' . $key] = true;
+        }
+
+        return count($moved);
     }
 
     /**
@@ -759,6 +1272,66 @@ final class StoryServiceTest extends AbstractTestCase
     /**
      * @return Point2D[] вершина => её место в кадре
      */
+    /**
+     * Собирают в укладку, а не в разметку.
+     *
+     * До настоящей укладки алгоритм проходит промежуточную: вершины дуги
+     * раскладываются вплотную к краю, и ближайшая пара расходится на доли
+     * пикселя. Если собирать туда, поле прилетает сплющенным в линию на
+     * границу — не то что порядок, сами поля неразличимы, и кажется, что
+     * укладка строится не в том порядке. Собирать надо в первую невырожденную.
+     *
+     * @param true[][] $connections
+     */
+    #[DataProvider('getGraphs')]
+    public function testLayoutIsBuiltIntoARealDrawing(array $connections): void
+    {
+        [$trace, $frames, $links] = $this->trace($connections);
+        $scenes = (new StoryService())->build($trace, $frames, $links);
+        $built = null;
+
+        foreach ($scenes as $scene) {
+            $built = $scene->kind === StageKind::Build ? $scene : $built;
+        }
+
+        self::assertNotNull($built, 'Укладка нигде не собирается.');
+        $near = self::nearest($this->pointsOf($built));
+        $final = self::nearest($this->pointsOf($scenes[count($scenes) - 1]));
+
+        if ($near === INF || $final === INF) {
+            return;
+        }
+
+        // Мериться надо с готовой укладкой, а не с абсолютным числом: на графе
+        // с хвостами алгоритм и в конце кладёт вершины тесно. Важно, что
+        // собранное — уже укладка того же порядка, а не расплющенная разметка.
+        self::assertGreaterThan(
+            $final / 4,
+            $near,
+            'Вершины собранной укладки слиплись: собирают в разметку, а не в укладку.',
+        );
+    }
+
+    /**
+     * Насколько близко сходятся две разные вершины.
+     *
+     * @param Point2D[] $points
+     */
+    private static function nearest(array $points): float
+    {
+        $points = array_values($points);
+        $count = count($points);
+        $result = INF;
+
+        for ($i = 0; $i < $count; $i++) {
+            for ($j = $i + 1; $j < $count; $j++) {
+                $result = min($result, hypot($points[$i]->x - $points[$j]->x, $points[$i]->y - $points[$j]->y));
+            }
+        }
+
+        return $result;
+    }
+
     private function pointsOf(Scene $scene): array
     {
         $result = [];

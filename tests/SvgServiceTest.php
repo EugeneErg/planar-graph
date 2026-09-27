@@ -18,7 +18,7 @@ final class SvgServiceTest extends AbstractTestCase
         $document = $this->parse($this->getSvgService()->render($this->square(), $this->squareConnections()));
 
         self::assertSame('svg', $document->documentElement?->tagName);
-        self::assertSame(4, $this->nodeCount($document, '//svg:line'));
+        self::assertSame(4, $this->nodeCount($document, '//svg:path'));
         self::assertSame(4, $this->nodeCount($document, '//svg:g[@class="vertex"]'));
     }
 
@@ -37,9 +37,35 @@ final class SvgServiceTest extends AbstractTestCase
             $this->scene($this->square(20)),
         ]));
 
-        // По четыре координаты на ребро: x1, y1, x2, y2.
-        self::assertSame(16, $this->nodeCount($document, '//svg:line/svg:animate'));
+        // Ребро — путь из одного отрезка: оба конца едут одной анимацией.
+        self::assertSame(4, $this->nodeCount($document, '//svg:path/svg:animate[@attributeName="d"]'));
         self::assertSame(4, $this->nodeCount($document, '//svg:animateTransform'));
+    }
+
+    /**
+     * У каждого кадра своя доля времени. Долей за сотню, идут они через
+     * тысячные — округлить их до сотых значит слепить соседние в одну,
+     * и кадр между ними получит нулевую длину: на картинке выделение
+     * и действие сливаются, как будто сначала всё подсветилось, а потом
+     * всё разом произошло.
+     */
+    public function testEveryFrameGetsItsOwnMoment(): void
+    {
+        $scenes = [];
+
+        for ($number = 0; $number < 150; $number++) {
+            $scenes[] = $this->scene($this->square(100 + $number % 2));
+        }
+
+        $document = $this->parse($this->getSvgService()->animate($scenes));
+        $moments = explode(';', $this->first($document, '//svg:animateTransform/@keyTimes'));
+
+        self::assertCount(count($scenes), $moments);
+        self::assertSame(
+            count($moments),
+            count(array_unique($moments)),
+            'Две доли времени совпали — кадр между ними не успеет показаться.',
+        );
     }
 
     public function testAnimationKeepsFirstAndLastPositions(): void
@@ -99,7 +125,7 @@ final class SvgServiceTest extends AbstractTestCase
 
         self::assertSame(
             ['1;0'],
-            $this->all($document, '//svg:line/svg:animate[@attributeName="opacity"]/@values'),
+            $this->all($document, '//svg:path/svg:animate[@attributeName="opacity"]/@values'),
         );
     }
 
@@ -278,13 +304,47 @@ final class SvgServiceTest extends AbstractTestCase
         );
 
         $document = $this->parse($this->getSvgService()->animate([$plain, $marked]));
-        $classes = $this->all($document, '//svg:line/svg:animate[@attributeName="class"]/@values');
+        $classes = $this->all($document, '//svg:path/svg:animate[@attributeName="class"]/@values');
         $style = $this->first($document, '//svg:style');
 
         self::assertContains('edge;edge half', $classes, 'Надрезанное ребро помечается особо.');
         self::assertContains('edge;edge g2', $classes, 'Ребро отрезанного поля красится в цвет поля.');
         self::assertStringContainsString('.edge.half{', $style);
         self::assertStringContainsString('.edge.g2{', $style);
+    }
+
+    /**
+     * Неподвижное не занимает места.
+     *
+     * Кадров в рассказе сотни, а каждый шар шевелится в считанных из них.
+     * Пока в svg писались все кадры подряд, сотня вершин давала полсотни
+     * мегабайт повторов одного и того же числа, и браузер на таком вставал.
+     * Записывать надо только те моменты, где значение менялось: между двумя
+     * равными концами и сплайн, и `discrete` дают ровно то же самое.
+     */
+    public function testStandingStillCostsNothing(): void
+    {
+        $scenes = [];
+
+        for ($number = 0; $number < 200; $number++) {
+            $scenes[] = $this->scene($this->square());
+        }
+
+        $scenes[] = $this->scene($this->square(40));
+        $document = $this->parse($this->getSvgService()->animate($scenes));
+        $values = explode(';', $this->first($document, '//svg:animateTransform/@values'));
+        $moments = explode(';', $this->first($document, '//svg:animateTransform/@keyTimes'));
+
+        self::assertCount(
+            3,
+            $values,
+            'Двести кадров стояния на месте записаны как двести значений вместо трёх.',
+        );
+        self::assertSame(count($values), count($moments));
+        self::assertSame($values[0], $values[1], 'Пока шар стоял, значение не должно меняться.');
+        self::assertNotSame($values[1], $values[2], 'Последний кадр — тот, в котором шар поехал.');
+        self::assertSame('0', $moments[0]);
+        self::assertSame('1', $moments[count($moments) - 1]);
     }
 
     public function testEmptyStoryFails(): void

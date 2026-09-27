@@ -80,7 +80,7 @@ readonly class EdgeService
                         }
                     }
 
-                    $innerVertexes = $this->getInnerVertexes($branch, $path, $outerVertexes, $slice);
+                    $innerVertexes = $this->getInnerVertexes($branch, $path, $outerVertexes, $slice, $trace);
 
                     if (
                         $first && ! $hasOuter
@@ -247,8 +247,9 @@ readonly class EdgeService
         array $path,
         array $outerVertexes,
         SliceAggregate $slice,
+        ?Trace $trace = null,
     ): array {
-        $innerIntersections = $this->intersectionService->getInnerIntersections($branch, $path, $outerVertexes, $slice);
+        $innerIntersections = $this->intersectionService->getInnerIntersections($branch, $path, $outerVertexes, $slice, $trace);
         $innerVertexes = array_map(fn (Intersection $intersection) => $intersection->vertexes, $innerIntersections);
 
         return array_merge(...$innerVertexes);

@@ -396,6 +396,6 @@ readonly class PlanarService
             );
         }
 
-        return $this->vertexService->mergeTree($edgesCube, $tree->connections, $sliceAggregate);
+        return $this->vertexService->mergeTree($edgesCube, $tree->connections, $sliceAggregate, $trace);
     }
 }

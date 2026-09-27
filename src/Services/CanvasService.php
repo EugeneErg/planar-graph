@@ -28,23 +28,27 @@ readonly class CanvasService
         $wave = [$vertex];
         // Снимок холста целиком, а не только этой заливки: иначе на картинке
         // стирается всё, что закрасили раньше.
-        $steps = [['wave' => $wave, 'pixels' => $canvas->getPixels()]];
+        $steps = [['wave' => $wave, 'pixels' => $canvas->getPixels(), 'flows' => []]];
 
         while ($wave !== []) {
             $next = [];
+            // Откуда в вершину пришла краска: по этой связи она и переползёт
+            // на картинке, и видно, какая точка какую закрасила.
+            $flows = [];
 
             foreach ($wave as $current) {
                 foreach (array_keys($canvas->graph->getConnection($current) ?? []) as $connected) {
                     if ($canvas->isPixel($connected, $oldColor)) {
                         $canvas->setPixel($connected, $color);
                         $next[] = $connected;
+                        $flows[$connected] = $current;
                         $result[] = $connected;
                     }
                 }
             }
 
             if ($next !== []) {
-                $steps[] = ['wave' => $next, 'pixels' => $canvas->getPixels()];
+                $steps[] = ['wave' => $next, 'pixels' => $canvas->getPixels(), 'flows' => $flows];
             }
 
             $wave = $next;
@@ -68,7 +72,7 @@ readonly class CanvasService
     }
 
     /**
-     * @param array<int, array{wave: int[], pixels: array<int, int>}> $steps волны заливки по порядку
+     * @param array<int, array{wave: int[], pixels: array<int, int>, flows: array<int, int>}> $steps волны заливки по порядку
      */
     private function traceFill(?Trace $trace, int $start, array $steps): void
     {
@@ -78,7 +82,7 @@ readonly class CanvasService
 
         $total = 0;
 
-        foreach ($steps as $number => ['wave' => $wave, 'pixels' => $pixels]) {
+        foreach ($steps as $number => ['wave' => $wave, 'pixels' => $pixels, 'flows' => $flows]) {
             $total += count($wave);
             $trace->add(
                 StageKind::Fill,
@@ -87,6 +91,7 @@ readonly class CanvasService
                     : sprintf('Заливка: шаг %d, закрашено %d', $number, $total),
                 $this->getGroups($pixels),
                 $wave,
+                $flows,
             );
         }
     }

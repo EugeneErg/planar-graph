@@ -110,11 +110,28 @@ readonly class TreeService
 
                 $hasResult = true;
                 $this->canvasService->setPixels($canvas, [$vertexA], ++$color);
+                // Точка сочленения перекрашена — значит, заперта: краска через
+                // неё не пройдёт, и заливка из соседа накроет ровно одну ветвь.
+                // Без этого кадра непонятно, почему заливка вдруг встала.
+                $trace?->add(
+                    StageKind::Block,
+                    sprintf('Запираем точку сочленения %d', $vertexA),
+                    [],
+                    [$vertexA],
+                );
                 $vertexes = $this->canvasService->fill($canvas, $vertexB, $color, $trace);
                 $vertexes[] = $vertexA;
 
                 if (! $this->split($articulationVertex, $canvas, $result, $color, $trace)) {
                     $result[] = $vertexes;
+                    $trace?->add(
+                        StageKind::Branch,
+                        sprintf('Ветвь на точке %d: %s', $vertexA, implode(' - ', $vertexes)),
+                        [],
+                        $vertexes,
+                        [],
+                        [[$vertexA]],
+                    );
                 }
             }
         }

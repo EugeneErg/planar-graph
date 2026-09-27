@@ -40,6 +40,12 @@ final readonly class SvgService
     /** Отложенное в сторону не прячется, а приглушается: граф виден целиком. */
     private const string FADED = '0.22';
 
+    /** Короче этого рассказ не бывает, даже если в нём всего пара шагов. */
+    private const float MIN_DURATION = 30.0;
+
+    /** Сколько секунд отводится на шаг обычного веса. */
+    private const float SECONDS_PER_WEIGHT = 0.45;
+
     public function __construct(
         private float $vertexRadius = 11.0,
         private float $margin = 24.0,
@@ -79,29 +85,62 @@ final readonly class SvgService
      * Картинка проигрывается один раз и замирает на готовой укладке: смотреть
      * на неё интереснее, чем на вечно начинающийся заново рассказ.
      *
+     * Длительность считается по самому рассказу: чем больше в нём шагов,
+     * тем дольше он идёт. Иначе у большого графа каждый шаг сжимается
+     * до неразличимого мига — а показывать надо как раз большие.
+     *
      * @param Scene[] $scenes
-     * @param float $duration длительность анимации в секундах
+     * @param ?float $duration длительность в секундах; по умолчанию — по числу шагов
+     * @param ?float $unit шаг между соседями, когда кусок лежит кругом. Если
+     *                     он известен, масштаб постоянный: между соседями на
+     *                     круге просвет ровно в одну вершину. Иначе масштаб
+     *                     подбирается по готовой укладке
      */
-    public function animate(array $scenes, float $duration = 30.0, bool $repeat = false): string
+    public function animate(array $scenes, ?float $duration = null, bool $repeat = false, ?float $unit = null): string
     {
-        $scenes = $this->scale(array_values($scenes));
+        $scenes = $this->scale(array_values($scenes), $unit);
+        $duration ??= $this->getDuration($scenes);
 
         if ($scenes === []) {
             throw new LogicException('Нужен хотя бы один кадр.');
         }
 
-        $keyTimes = $this->getKeyTimes($scenes);
+        $keyTimes = $this->getRoundedTimes($this->getKeyTimes($scenes));
         $body = '';
 
         foreach ($this->getEdgeKeys($scenes) as $key) {
             $body .= $this->renderEdge($key, $scenes, $keyTimes, $duration, $repeat);
         }
 
+        $body .= $this->renderFlows($scenes, $keyTimes, $duration);
+
         foreach ($this->getVertexKeys($scenes) as $key) {
             $body .= $this->renderVertex($key, $scenes, $keyTimes, $duration, $repeat);
         }
 
-        return $this->renderDocument($this->getViewBox($scenes), $body);
+        return $this->renderDocument($this->getViewBox($scenes), $this->renderCamera($scenes, $keyTimes, $duration, $repeat) . $body);
+    }
+
+    /**
+     * Камера: рамка в каждом кадре подогнана под то, что на картинке сейчас,
+     * и плавно едет от кадра к кадру. Рисунок всегда занимает всё окно:
+     * пока граф разложен по столам, камера отъезжает, когда он собран —
+     * наезжает на него.
+     *
+     * Рамка меняется с тем же сглаживанием и в те же моменты, что и
+     * движение вершин, поэтому вершина в пути из рамки не выходит.
+     *
+     * @param Scene[] $scenes
+     * @param float[] $keyTimes
+     */
+    private function renderCamera(array $scenes, array $keyTimes, float $duration, bool $repeat): string
+    {
+        $boxes = array_map(
+            fn (Scene $scene): string => implode(' ', array_map(self::number(...), $this->getViewBox([$scene]))),
+            $scenes,
+        );
+
+        return $this->renderAnimate('viewBox', $boxes, $keyTimes, $duration, $repeat);
     }
 
     /**
@@ -109,30 +148,37 @@ final readonly class SvgService
      * не налезали друг на друга: иначе картинку приходится приближать.
      *
      * @param Scene[] $scenes
+     * @param ?float $unit шаг между соседями на круге, если известен
      *
      * @return Scene[]
      */
-    private function scale(array $scenes): array
+    private function scale(array $scenes, ?float $unit = null): array
     {
         if ($scenes === []) {
             return $scenes;
         }
 
-        $final = $scenes[count($scenes) - 1];
-        $distance = $this->getMinVertexDistance($final->vertexes);
+        if ($unit !== null && $unit > GeometryService::EPSILON) {
+            // Центры соседей — в двух поперечниках вершины: между шарами
+            // остаётся ровно ещё один.
+            $scale = 4 * $this->vertexRadius / $unit;
+        } else {
+            $final = $scenes[count($scenes) - 1];
+            $distance = $this->getMinVertexDistance($final->vertexes);
 
-        if ($distance === null || $distance < GeometryService::EPSILON) {
-            return $scenes;
-        }
+            if ($distance === null || $distance < GeometryService::EPSILON) {
+                return $scenes;
+            }
 
-        // Мало развести вершины: вершина, налезшая на чужое ребро, читается
-        // как пересечение, которого нет. Поэтому масштаб берётся такой, чтобы
-        // и между вершинами, и между вершиной и чужим ребром был просвет.
-        $clearance = $this->getMinEdgeClearance($final);
-        $scale = $this->vertexRadius * $this->minVertexGap / $distance;
+            // Мало развести вершины: вершина, налезшая на чужое ребро, читается
+            // как пересечение, которого нет. Поэтому масштаб берётся такой, чтобы
+            // и между вершинами, и между вершиной и чужим ребром был просвет.
+            $clearance = $this->getMinEdgeClearance($final);
+            $scale = $this->vertexRadius * $this->minVertexGap / $distance;
 
-        if ($clearance !== null && $clearance > GeometryService::EPSILON) {
-            $scale = max($scale, $this->vertexRadius * $this->minEdgeGap / $clearance);
+            if ($clearance !== null && $clearance > GeometryService::EPSILON) {
+                $scale = max($scale, $this->vertexRadius * $this->minEdgeGap / $clearance);
+            }
         }
 
         $point = static fn (Point2D $item): Point2D => new Point2D($item->x * $scale, $item->y * $scale);
@@ -149,6 +195,9 @@ final readonly class SvgService
                 faded: $scene->faded,
                 weight: $scene->weight,
                 kind: $scene->kind,
+                flows: $scene->flows,
+                ties: $scene->ties,
+                blocked: $scene->blocked,
             ),
             $scenes,
         );
@@ -263,7 +312,12 @@ final readonly class SvgService
             // Цвет ребра задаётся классом, а не атрибутом: правило стиля всё
             // равно перебило бы и атрибут, и его анимацию, а внутри анимации
             // переменная темы не работает.
-            $classes[] = $this->getEdgeClass($scene->groups[$key] ?? null);
+            // Выделяется поле целиком — и шары, и палки между ними. Обвести
+            // одни шары мало: в клубке они разбросаны по всей окружности,
+            // и какое поле собрались резать, по ним не прочесть.
+            $classes[] = $this->getEdgeClass($scene->groups[$key] ?? null)
+                . (isset($scene->ties[$key]) ? ' tie' : '')
+                . (isset($scene->highlight[$key]) ? ' mark' : '');
         }
 
         $first = $this->getFirstDefined($points);
@@ -275,27 +329,132 @@ final readonly class SvgService
         $shown = $this->fadeWhileMoving($shown);
         $animations = '';
 
-        foreach (['x1' => [0, 'x'], 'y1' => [0, 'y'], 'x2' => [1, 'x'], 'y2' => [1, 'y']] as $attribute => [$end, $axis]) {
-            $values = array_map(
-                static fn (?array $item): string => self::number(($item ?? $first)[$end]->$axis),
-                $points,
-            );
-            $animations .= $this->renderAnimate($attribute, $values, $keyTimes, $duration, $repeat);
-        }
+        // Ребро — путь из одного отрезка: оба конца едут одной анимацией,
+        // а не четырьмя (x1, y1, x2, y2), у каждой из которых свой список
+        // моментов и сглаживаний.
+        $line = static fn (array $item): string => sprintf(
+            'M%s %sL%s %s',
+            self::number($item[0]->x),
+            self::number($item[0]->y),
+            self::number($item[1]->x),
+            self::number($item[1]->y),
+        );
+        $animations = $this->renderAnimate(
+            'd',
+            array_map(static fn (?array $item): string => $line($item ?? $first), $points),
+            $keyTimes,
+            $duration,
+            $repeat,
+        );
 
         return sprintf(
-            '<line class="%s" x1="%s" y1="%s" x2="%s" y2="%s" opacity="%s">%s%s%s</line>',
+            '<path class="%s" d="%s" opacity="%s">%s%s%s</path>',
             $classes[0],
-            self::number($first[0]->x),
-            self::number($first[0]->y),
-            self::number($first[1]->x),
-            self::number($first[1]->y),
+            $line($first),
             $shown[0],
             $animations,
             $this->renderAnimate('opacity', $shown, $keyTimes, $duration, $repeat, discrete: true),
             count(array_unique($classes)) < 2
                 ? ''
                 : $this->renderAnimate('class', $classes, $keyTimes, $duration, $repeat, discrete: true),
+        );
+    }
+
+    /**
+     * Сколько идёт рассказ: столько, сколько в нём шагов, но не меньше минуты
+     * пополам. Шаг держится примерно полсекунды — за меньшее не уследить.
+     *
+     * @param Scene[] $scenes
+     */
+    private function getDuration(array $scenes): float
+    {
+        $total = .0;
+
+        foreach ($scenes as $number => $scene) {
+            $total += $number === 0 ? .0 : $scene->weight;
+        }
+
+        return max(self::MIN_DURATION, $total * self::SECONDS_PER_WEIGHT);
+    }
+
+    /**
+     * Краска, ползущая по ребру.
+     *
+     * Ребро прорисовывается от закрашенного конца к другому: линия того же
+     * цвета лежит поверх ребра и «дорисовывается» пунктиром с уезжающим
+     * сдвигом. Едет она ровно тот отрезок времени, за который кадр сменяется
+     * следующим, — и к моменту, когда краска дошла, вершина на том конце уже
+     * закрашена. Пока краска ползёт, граф стоит на месте, поэтому линии
+     * хватает постоянных координат.
+     *
+     * @param Scene[] $scenes
+     * @param float[] $keyTimes
+     */
+    private function renderFlows(array $scenes, array $keyTimes, float $duration): string
+    {
+        $result = '';
+
+        foreach ($scenes as $number => $scene) {
+            if ($number === 0) {
+                continue;
+            }
+
+            foreach ($scene->flows as $key => [$from, $group]) {
+                $edge = $scene->edges[$key] ?? null;
+                $start = $scene->vertexes[$from] ?? null;
+
+                if ($edge === null || $start === null) {
+                    continue;
+                }
+
+                $result .= $this->renderFlow(
+                    $edge,
+                    $start,
+                    $group,
+                    $keyTimes[$number - 1] * $duration,
+                    $keyTimes[$number] * $duration,
+                );
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param array{Point2D, Point2D} $edge
+     */
+    private function renderFlow(array $edge, Point2D $start, int $group, float $from, float $to): string
+    {
+        // Рисуем от того конца, с которого пришла краска.
+        [$head, $tail] = hypot($edge[0]->x - $start->x, $edge[0]->y - $start->y)
+            <= hypot($edge[1]->x - $start->x, $edge[1]->y - $start->y)
+                ? [$edge[0], $edge[1]]
+                : [$edge[1], $edge[0]];
+        $length = hypot($tail->x - $head->x, $tail->y - $head->y);
+
+        if ($length < GeometryService::EPSILON || $to - $from < GeometryService::EPSILON) {
+            return '';
+        }
+
+        return sprintf(
+            '<line class="edge g%d flow" x1="%s" y1="%s" x2="%s" y2="%s" opacity="0"'
+            . ' stroke-dasharray="%s" stroke-dashoffset="%s">'
+            . '<set attributeName="opacity" to="1" begin="%ss" fill="freeze"/>'
+            . '<animate attributeName="stroke-dashoffset" begin="%ss" dur="%ss" values="%s;0" fill="freeze"/>'
+            . '<set attributeName="opacity" to="0" begin="%ss" fill="freeze"/>'
+            . '</line>',
+            $group % count(self::PALETTE),
+            self::number($head->x),
+            self::number($head->y),
+            self::number($tail->x),
+            self::number($tail->y),
+            self::number($length),
+            self::number($length),
+            self::number($from),
+            self::number($from),
+            self::number($to - $from),
+            self::number($length),
+            self::number($to),
         );
     }
 
@@ -310,6 +469,7 @@ final readonly class SvgService
         $fills = [];
         $opacities = [];
         $rings = [];
+        $locks = [];
         $last = null;
 
         foreach ($scenes as $scene) {
@@ -319,6 +479,10 @@ final readonly class SvgService
             $group = $scene->groups[$key] ?? null;
             $fills[] = $this->getGroupColor($group);
             $opacities[] = $group === null ? '0' : '0.35';
+            // Запертый шар обведён толстым тёмным кольцом: краска через него
+            // не пройдёт. Заливкой его не пометить — под ней не видно номера,
+            // а номер тут нужен: по нему и читается, что заперли.
+            $locks[] = isset($scene->blocked[$key]) ? '1' : '0';
             $rings[] = isset($scene->highlight[$key]) ? '1' : '0';
         }
 
@@ -340,6 +504,7 @@ final readonly class SvgService
                 . '<circle class="base" r="%s"/>'
                 . '<circle class="group" r="%s" fill="%s" fill-opacity="%s">%s%s</circle>'
                 . '<circle class="ring" r="%s" opacity="%s">%s</circle>'
+                . '<circle class="lock" r="%s" opacity="%s">%s</circle>'
                 . '<text dominant-baseline="central" text-anchor="middle">%d</text></g>',
             $positions[0],
             $shown[0],
@@ -354,6 +519,9 @@ final readonly class SvgService
             self::number($this->vertexRadius + 3),
             $rings[0],
             $this->renderAnimate('opacity', $rings, $keyTimes, $duration, $repeat, discrete: true),
+            self::number($this->vertexRadius + 5),
+            $locks[0],
+            $this->renderAnimate('opacity', $locks, $keyTimes, $duration, $repeat, discrete: true),
             Scene::vertexOf($key),
         );
     }
@@ -456,6 +624,48 @@ final readonly class SvgService
 
 
     /**
+     * Оставляет только те моменты, в которых значение менялось.
+     *
+     * Кадров в рассказе сотни, а каждая вершина шевелится в считанных из них.
+     * Пока в `values` писались все кадры подряд, один шар уносил по числу
+     * на кадр — и на сотне вершин svg распухал до полусотни мегабайт, из
+     * которых почти всё — повторение одного и того же. Браузер на таком
+     * встаёт, а видно ровно то же самое.
+     *
+     * Середина постоянного участка ничего не задаёт: `discrete` держит
+     * значение до следующего момента, а сплайн между двумя равными концами
+     * даёт ту же прямую. Поэтому из каждого такого участка остаются только
+     * его концы — картинка та же, а размер падает во столько раз, во сколько
+     * кадров больше, чем движений.
+     *
+     * @param string[] $values
+     * @param float[] $keyTimes
+     *
+     * @return array{string[], float[]}
+     */
+    private function getChanges(array $values, array $keyTimes): array
+    {
+        $count = count($values);
+        $moments = [];
+        $result = [];
+
+        for ($number = 0; $number < $count; $number++) {
+            if ($number !== 0
+                && $number !== $count - 1
+                && $values[$number] === $values[$number - 1]
+                && $values[$number] === $values[$number + 1]
+            ) {
+                continue;
+            }
+
+            $result[] = $values[$number];
+            $moments[] = $keyTimes[$number];
+        }
+
+        return [$result, $moments];
+    }
+
+    /**
      * @param string[] $values
      * @param float[] $keyTimes
      */
@@ -472,9 +682,10 @@ final readonly class SvgService
             return '';
         }
 
+        [$values, $keyTimes] = $this->getChanges($values, $keyTimes);
         $smoothing = $discrete
             ? ' calcMode="discrete"'
-            : sprintf(' calcMode="spline" keySplines="%s"', implode(';', array_fill(0, count($values) - 1, '0.4 0 0.2 1')));
+            : sprintf(' calcMode="spline" keySplines="%s"', implode(';', array_fill(0, count($values) - 1, '.4 0 .2 1')));
 
         return sprintf(
             '<%s attributeName="%s"%s dur="%ss" values="%s" keyTimes="%s"%s repeatCount="%s" fill="freeze"/>',
@@ -483,7 +694,7 @@ final readonly class SvgService
             $tag === 'animateTransform' ? ' type="translate"' : '',
             self::number($duration),
             implode(';', $values),
-            implode(';', array_map(self::number(...), $keyTimes)),
+            implode(';', array_map(self::moment(...), $keyTimes)),
             $smoothing,
             $repeat ? 'indefinite' : '1',
         );
@@ -546,13 +757,23 @@ final readonly class SvgService
             . '<style>'
             . ':root{color-scheme:light dark}'
             . 'svg{--paper:#fdfdfc;--line:#3d3929;--edge:#8a8781;--half:#bf8a3d;background:var(--paper)}'
-            . '.edge{stroke:var(--edge);stroke-width:1.6;stroke-linecap:round}'
+            . '.edge{fill:none;stroke:var(--edge);stroke-width:2.4;stroke-linecap:round}'
             // Надрезанное ребро: одно поле его уже забрало, второе ещё нет.
-            . '.edge.half{stroke:var(--half);stroke-width:2.2}'
+            . '.edge.half{stroke:var(--half);stroke-width:2.4}'
+            // Краска, ползущая по ребру: той же толщины, что и само ребро, —
+            // она и есть ребро, закрашенное до сюда.
+            . '.edge.flow{stroke-width:2.4;stroke-linecap:round}'
+            // Связка: её в графе нет, её добавила склейка — поэтому пунктир.
+            . '.edge.tie{stroke-dasharray:7 6;stroke-width:2.2;opacity:0.75}'
+            // Выделенное поле: тем же цветом, что и кольцо на его шарах, —
+            // обвод один, просто он идёт по всему полю, а не по точкам.
+            . '.edge.mark{stroke:#c96442;stroke-width:3.6;opacity:1}'
             . $this->renderEdgeColors()
             . '.vertex .base{fill:var(--paper);stroke:var(--line);stroke-width:1.8}'
             . '.vertex .group{stroke:none}'
             . '.vertex .ring{fill:none;stroke:#c96442;stroke-width:2.4}'
+            // Запертый шар: краска через него не пройдёт.
+            . '.vertex .lock{fill:none;stroke:var(--line);stroke-width:3.4}'
             . '.vertex text{fill:var(--line);font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace}'
             . '@media (prefers-color-scheme:dark){'
             . 'svg{--paper:#1f1e1d;--line:#e8e6dc;--edge:#6b6862;--half:#d6a354}'
@@ -570,6 +791,43 @@ final readonly class SvgService
 
     private static function number(float $value): string
     {
-        return rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.') ?: '0';
+        return rtrim(rtrim(number_format($value, 1, '.', ''), '0'), '.') ?: '0';
+    }
+
+    /**
+     * Доли времени — с тем числом знаков, при котором соседние ещё
+     * различаются, и не больше: лишние знаки повторяются в каждой анимации
+     * каждого шара и каждой палки.
+     *
+     * @param float[] $keyTimes
+     *
+     * @return float[]
+     */
+    private function getRoundedTimes(array $keyTimes): array
+    {
+        for ($digits = 3; $digits < 6; $digits++) {
+            $rounded = array_map(static fn (float $time): float => round($time, $digits), $keyTimes);
+
+            if (count(array_unique(array_map(strval(...), $rounded))) === count($rounded)) {
+                return $rounded;
+            }
+        }
+
+        return $keyTimes;
+    }
+
+    /**
+     * Доля времени кадра: округлять её до сотых нельзя.
+     *
+     * Кадров в рассказе за сотню, доли идут через тысячные — при округлении
+     * соседние сливаются в одну, и кадр между ними получает нулевую длину.
+     * На картинке это выглядит так, будто выделение и действие слиплись:
+     * сначала всё подсветилось, потом всё разом произошло.
+     */
+    private static function moment(float $value): string
+    {
+        // Ноль перед точкой не нужен: «.25» — такое же число, как «0.25»,
+        // а повторяется оно в каждой анимации.
+        return preg_replace('/^0(?=\.)/', '', rtrim(rtrim(number_format($value, 6, '.', ''), '0'), '.') ?: '0') ?? '0';
     }
 }

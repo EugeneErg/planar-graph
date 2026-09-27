@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace EugeneErg\Graphs\Services;
 
 use EugeneErg\Graphs\Aggregates\SliceAggregate;
+use EugeneErg\Graphs\Aggregates\Trace;
 use EugeneErg\Graphs\ValueObjects\DirectionGraph;
 use EugeneErg\Graphs\ValueObjects\Edge;
+use EugeneErg\Graphs\ValueObjects\StageKind;
 
 /**
  * Склейка двусвязных ветвей в одну плоскую укладку.
@@ -35,7 +37,7 @@ readonly class VertexService
      * @param Edge[][] $vertexes
      * @return Edge[]
      */
-    public function mergeTree(array $vertexes, DirectionGraph $treeGraph, SliceAggregate $slice): array
+    public function mergeTree(array $vertexes, DirectionGraph $treeGraph, SliceAggregate $slice, ?Trace $trace = null): array
     {
         if ($treeGraph->vertexes === []) {
             return $vertexes[0];
@@ -87,6 +89,7 @@ readonly class VertexService
 
             if ($countAIsW && $countBIsW) {
                 $newEdge = $this->getEdgeFromWW($vertex, $edgeA, $edgeB);
+                $this->traceTie($trace, $vertex, $edgeA, $edgeB, [$newEdge, $newEdge]);
                 unset($edgeMap[$branch]);
                 unset($edgeMap[$root]);
                 unset($edgeLists[$edgeNumberB]);
@@ -101,6 +104,7 @@ readonly class VertexService
                         $countAIsW ? $edgeB : $edgeA
                     )
                     : $this->getEdgesFromVV($vertex, $edgeA, $edgeB);
+                $this->traceTie($trace, $vertex, $edgeA, $edgeB, $newEdges);
                 $this->delEdgeFromMap([$edgeNumberA => $edgeA], $root, $edgeMap);
                 $this->moveEdgeInMap($branch, $root, $edgeNumberB, $edgeMap);
                 [$edgeLists[$edgeNumberA], $edgeLists[$edgeNumberB]] = $newEdges;
@@ -115,6 +119,30 @@ readonly class VertexService
         }
 
         return array_values($edgeLists);
+    }
+
+    /**
+     * Одна склейка: две грани сходятся в точке сочленения и дают новые грани.
+     * Стыки в новых обходах — это и есть добавленные связи: в самом графе их
+     * нет, поэтому на картинке они пунктирные.
+     *
+     * @param Edge[] $produced
+     */
+    private function traceTie(?Trace $trace, int $vertex, Edge $edgeA, Edge $edgeB, array $produced): void
+    {
+        $trace?->add(
+            StageKind::Tie,
+            sprintf(
+                'Связываем ветви в точке %d: %s + %s',
+                $vertex,
+                implode(' - ', $edgeA->vertexes),
+                implode(' - ', $edgeB->vertexes),
+            ),
+            [$edgeA->vertexes, $edgeB->vertexes],
+            [$vertex],
+            [],
+            array_map(static fn (Edge $edge): array => $edge->vertexes, $produced),
+        );
     }
 
     /**

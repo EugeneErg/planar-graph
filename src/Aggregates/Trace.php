@@ -22,10 +22,18 @@ final class Trace
     /**
      * @param array<int, int[]> $groups
      * @param int[] $highlight
+     * @param array<int, int> $flows вершина => от какой вершины к ней пришло
+     * @param array<int, int[]> $produced обходы граней, получившихся на шаге
      */
-    public function add(StageKind $kind, string $caption, array $groups = [], array $highlight = []): void
-    {
-        $this->stages[] = new Stage($kind, $caption, $groups, $highlight);
+    public function add(
+        StageKind $kind,
+        string $caption,
+        array $groups = [],
+        array $highlight = [],
+        array $flows = [],
+        array $produced = [],
+    ): void {
+        $this->stages[] = new Stage($kind, $caption, $groups, $highlight, $flows, $produced);
     }
 
     /**

@@ -7,25 +7,47 @@ namespace EugeneErg\Graphs\Services;
 use EugeneErg\Graphs\Aggregates\CutPlan;
 use EugeneErg\Graphs\Aggregates\Trace;
 use EugeneErg\Graphs\ValueObjects\Piece;
+use EugeneErg\Graphs\ValueObjects\Places;
 use EugeneErg\Graphs\ValueObjects\Point2D;
 use EugeneErg\Graphs\ValueObjects\Scene;
-use EugeneErg\Graphs\ValueObjects\Stage;
+use EugeneErg\Graphs\ValueObjects\Script\ActionInterface;
+use EugeneErg\Graphs\ValueObjects\Script\Aside;
+use EugeneErg\Graphs\ValueObjects\Script\Block;
+use EugeneErg\Graphs\ValueObjects\Script\Build;
+use EugeneErg\Graphs\ValueObjects\Script\Cut;
+use EugeneErg\Graphs\ValueObjects\Script\Detach;
+use EugeneErg\Graphs\ValueObjects\Script\Join;
+use EugeneErg\Graphs\ValueObjects\Script\Paint;
+use EugeneErg\Graphs\ValueObjects\Script\Relax;
+use EugeneErg\Graphs\ValueObjects\Script\Script;
+use EugeneErg\Graphs\ValueObjects\Script\Show;
+use EugeneErg\Graphs\ValueObjects\Script\Step;
+use EugeneErg\Graphs\ValueObjects\Script\Tie;
+use EugeneErg\Graphs\ValueObjects\Script\Together;
 use EugeneErg\Graphs\ValueObjects\StageKind;
+use EugeneErg\Graphs\ValueObjects\Table;
+use EugeneErg\Graphs\ValueObjects\TableSize;
 
 /**
- * Превращает журнал шагов в последовательность кадров.
+ * Исполняет инструкцию: превращает действия в кадры.
+ *
+ * Инструкцию собирает `ScriptService` — она говорит, что делают с клубком,
+ * по одному действию за раз. Здесь решается только одно: где это нарисовать.
  *
  * Рассказ держится на трёх правилах.
  *
- * Первое: за выделением сразу следует то, ради чего выделяли, — отметили кусок
- * и тут же его отрезали.
+ * Первое: за выделением сразу следует то, ради чего выделяли. Правило не
+ * соблюдается, а обеспечивается: выделение живёт внутри действия (`Step`),
+ * поэтому кадры выделения и кадр действия выдаются вместе и разъединить их
+ * нечем. Пока кадры собирались по видам шагов, раз за разом получался
+ * светофор — сначала обводилось всё, потом всё разом происходило.
  *
  * Второе: резать по-настоящему. Отрезанный кусок уезжает в сторону целиком, а
  * вершины и рёбра на границе разреза раздваиваются, чтобы связи с бывшим
  * соседом не осталось: так же отрезают кусок пирога.
  *
- * Третье: едет только то, что режут. Весь план разреза известен заранее
- * (`CutPlan`), поэтому у куска одно место на столе на всю анимацию, а его
+ * Третье: едет только то, что режут. Инструкция проиграна целиком до первого
+ * кадра (`CutPlan`), поэтому у куска одно место на столе на всю анимацию, а его
  * экземпляры лежат поверх оригиналов ещё до разреза. Отрезанное отделяется от
  * графа на глазах, а не появляется из воздуха, и соседние куски при этом
  * стоят на месте.
@@ -40,8 +62,12 @@ final readonly class StoryService
     /** Действие: кусок отъезжает, поле встаёт на место. */
     private const float ACT_WEIGHT = 1.0;
 
-    /** Волна заливки короче: их много, и каждая мелкая. */
-    private const float WAVE_WEIGHT = 0.5;
+    /**
+     * Волна заливки: за это время краска переползает по ребру до следующей
+     * вершины. Слишком коротко — и видно только, что точки меняют цвет,
+     * а как одна закрашивает другую, уследить нельзя.
+     */
+    private const float WAVE_WEIGHT = 1.0;
 
     /** Столько времени занимает целиком шаг, на котором вершины едут. */
     private const float MOVING_WEIGHT = 4.0;
@@ -58,153 +84,685 @@ final readonly class StoryService
     /** Стол, на котором лежит весь граф, пока он не распался на куски. */
     private const int WHOLE_TABLE = 0;
 
+    /**
+     * В какой кадр укладки собирают.
+     *
+     * Кадр 0 — клубок, кадр 1 — разметка по дугам: там вершины дуги лежат
+     * вплотную к краю, ближайшая пара расходится на треть пикселя. Собирать
+     * туда нельзя: поле прилетает сплющенным в линию на границу, и не то что
+     * порядок — сами поля неразличимы. Первая настоящая укладка — следующая,
+     * барицентрическая: она уже плоская и невырожденная, с неё и начинается
+     * расслабление.
+     */
+    private const int BUILT_FRAME = 2;
+
     public function __construct(
         private MotionService $motion = new MotionService(),
         private int $targetFrames = 2,
+        private ScriptService $script = new ScriptService(),
+        private PlaceService $place = new PlaceService(),
     ) {
     }
 
     /**
      * @param Point2D[][] $frames кадры укладки: клубок, начальная раскладка, расслабление
      * @param array<int, array<int, mixed>> $connections
+     * @param ?Script $script рассказать не всю инструкцию, а эту: так
+     *                        смотрят один этап отдельно от остальных
      *
      * @return Scene[]
      */
-    public function build(Trace $trace, array $frames, array $connections): array
+    public function build(Trace $trace, array $frames, array $connections, ?Script $script = null): array
     {
         $frames = array_values($frames);
         $tangled = $frames[0] ?? [];
         $edges = $this->motion->getEdges($connections);
-        $stages = $trace->getStages();
         $whole = Piece::ofEdges($edges);
+        $script ??= $this->script->compile($trace, $connections);
 
-        if ($stages === [] || $tangled === []) {
+        if ($trace->getStages() === [] || $tangled === []) {
             return $this->getMovingScenes(new CutPlan($whole, []), $frames, $edges, 0, count($frames) - 1);
         }
 
-        $plan = $this->getCutPlan($trace, $connections);
+        $plan = $this->script->execute($trace, $connections, $script);
         $spacing = $this->getSpacing($tangled);
-        $order = $this->getBuildOrder($stages);
-        $tables = $this->getTables($plan, $tangled, $frames[count($frames) - 1], $spacing);
+        $frame = min(self::BUILT_FRAME, count($frames) - 1);
+        $tables = $this->getTables($plan, $tangled, array_slice($frames, $frame), $spacing);
+        $where = $this->getVertexTables($plan);
         // Каждый кусок собирается у себя на столе, поэтому готовая укладка
         // переносится туда же.
-        $building = $this->getShifted($frames[1] ?? $tangled, $plan, $tables);
-        $result = [];
-        $marked = [];
-        $step = 0;
-
-        foreach ($stages as $number => $stage) {
-            $scenes = $this->getStageScenes($plan, $number, $stage, $order, $step, $tangled, $tables, $spacing, $building);
-
-            foreach ($scenes as $scene) {
-                $result[] = $marked === [] ? $scene : $this->withMark($scene, $marked);
-            }
-
-            if ($stage->kind === StageKind::Build) {
-                $step++;
-            }
-
-            // Кольцо на точках сочленения держится до самого разреза: сначала
-            // видно, где резать, потом — как по этим местам и разрезали.
-            $marked = match ($stage->kind) {
-                StageKind::ArticulationVertexes => $stage->highlight,
-                StageKind::Branches => [],
-                default => $marked,
-            };
-        }
-
+        $building = $this->getShifted($frames[$frame] ?? $tangled, $plan, $tables);
         $moving = array_map(
             fn (array $frame): array => $this->getShifted($frame, $plan, $tables),
             $frames,
         );
+        $result = [];
+        $built = [];
+        $next = [];
+        // Заливка красит куски графа, и краска с них не сходит: зелёное —
+        // это «один кусок», и оно должно остаться зелёным, пока кусок цел.
+        $painted = [];
+        // Запертый обход, по порядку: пока он заперт, видно, про что спрашивают.
+        $locked = [];
+        // Запертые обходы: по ним столы и разложены по трём кругам. Их две
+        // пары — «как было» и «как стало»: раскладка меняется вместе с самим
+        // действием, а не на коротком кадре выделения перед ним. Иначе полстола
+        // перепрыгивает за долю секунды.
+        $examined = [];
+        $moved = [];
+        // Вынесенное наружу: не поместилось внутрь запертого обхода.
+        $aside = [];
+        $moved = [];
 
-        foreach ($this->getMovingScenes($plan, $moving, $edges, min(1, count($frames) - 1), count($frames) - 1) as $scene) {
-            $result[] = $scene;
+        foreach ($script->steps as $number => $step) {
+            if ($step->action instanceof Build) {
+                $built[] = $step->action->piece;
+            }
+
+            if ($step->action instanceof Paint) {
+                $painted = $step->action->groups + $painted;
+            }
+
+            $blocked = false;
+
+            foreach ($step->actions() as $action) {
+                // Запирание задаёт новый вопрос: что накроет заливка, упёршись
+                // в эти шары. Прежние ответы к нему отношения не имеют,
+                // поэтому краска сбрасывается, и в кадре остаётся только
+                // запертое.
+                if ($action instanceof Block) {
+                    // Порядок обхода важен: запертое ложится на средний круг
+                    // многоугольником, а не сбивается в дугу там, где лежало.
+                    $locked = $blocked ? array_merge($locked, $action->vertexes) : $action->vertexes;
+                    $painted = $blocked ? $painted : [];
+                    $blocked = true;
+
+                    // Круги — про поиск полей: там запирают целый обход.
+                    // Запертая точка сочленения раскладку не трогает: кусок
+                    // лежит как лежал, а спрашивают только, что на ней висит.
+                    if ($action->walk) {
+                        // Раскладки копятся: стол, уже разложенный по кругам,
+                        // так и остаётся разложенным. Иначе стоит алгоритму
+                        // заняться другим куском, и первый разом схлопнется.
+                        $next[] = $action->vertexes;
+                        $moved = [];
+                    }
+                }
+
+                // Проверка решила: этот кусок внутрь не помещается. Он уезжает
+                // на внешний круг и ждёт там до конца разбора этого обхода.
+                if ($action instanceof Aside) {
+                    $moved += array_fill_keys($action->vertexes, true);
+                }
+            }
+
+
+            $scenes = $this->getStepScenes($plan, $number + 1, $step, $built, $painted, $locked, [$examined, $next], [$aside, $moved], $tangled, $tables, $spacing, $building, $moving, $edges, $frame, $where);
+            $last = count($scenes) - 1;
+
+            foreach ($scenes as $position => $scene) {
+                // Ответ снимает запор, и в том же кадре, в котором отвечают.
+                // Запирают, чтобы спросить: что накроет заливка, упёршись
+                // в эти шары. Отрезали по ответу — вопроса больше нет,
+                // и колец тоже.
+                //
+                // Пока запор держался до следующего запирания, последний так
+                // и оставался висеть до конца: готовая укладка стояла
+                // с кольцами на шарах, про которые давно всё решено.
+                $result[] = $this->getLocked(
+                    $scene,
+                    $step->action->isQuestion() || $position < $last ? $locked : [],
+                );
+            }
+
+            $examined = $next;
+            $aside = $moved;
+
+            if (! $step->action->isQuestion()) {
+                $locked = [];
+            }
+
+
         }
 
         return $result;
     }
 
     /**
-     * Весь разрез, посчитанный до первого кадра.
+     * Отметить в кадре запертые шары — все их экземпляры.
+     *
+     * Заперт шар, а не его копия: копии стоят друг на друге и на картинке
+     * неразличимы, поэтому запереть одну и оставить другую открытой значило бы
+     * показать неправду.
+     *
+     * @param int[] $locked
+     */
+    private function getLocked(Scene $scene, array $locked): Scene
+    {
+        if ($locked === []) {
+            return $scene;
+        }
+
+        $inside = array_flip($locked);
+        $keys = [];
+
+        foreach (array_keys($scene->vertexes) as $key) {
+            if (isset($inside[Scene::vertexOf($key)])) {
+                $keys[$key] = true;
+            }
+        }
+
+        return $keys === [] ? $scene : new Scene(
+            vertexes: $scene->vertexes,
+            edges: $scene->edges,
+            groups: $scene->groups,
+            highlight: $scene->highlight,
+            faded: $scene->faded,
+            weight: $scene->weight,
+            kind: $scene->kind,
+            flows: $scene->flows,
+            ties: $scene->ties,
+            blocked: $keys,
+        );
+    }
+
+    /**
+     * Инструкция, проигранная целиком до первого кадра.
      *
      * @param array<int, array<int, mixed>> $connections
      */
     public function getCutPlan(Trace $trace, array $connections): CutPlan
     {
-        $edges = $this->motion->getEdges($connections);
-        $stages = $trace->getStages();
-        $result = new CutPlan(Piece::ofEdges($edges), $this->getCutCount($edges, $stages));
-        $order = $this->getBuildOrder($stages);
+        return $this->script->execute($trace, $connections, $this->script->compile($trace, $connections));
+    }
 
-        foreach ($stages as $stage) {
-            match ($stage->kind) {
-                StageKind::Components => $result->split($stage->groups, true),
-                StageKind::Branches => $result->split($stage->groups),
-                StageKind::Field => $result->cutOut(Piece::ofWalk($stage->highlight)),
-                default => null,
-            };
-            $result->snapshot();
+    /**
+     * Кадры одного действия: сначала выделение, потом само действие.
+     *
+     * Ровно в таком порядке и без исключений — выделение и действие приходят
+     * одним шагом, поэтому выдать одно без другого нельзя. Состояние — это то,
+     * что стало после действия; предыдущее — то, что было до: выделение
+     * показывается на «до», действие — на «после».
+     *
+     * Действие, которое клубок не изменило, кадров не получает вовсе: обводить
+     * нечего и показывать нечего.
+     *
+     * @param int[] $built куски, которые уже уложены
+     * @param array<int, int> $painted шар => каким цветом его закрасила заливка
+     * @param int[] $locked запертый обход: краска через него не идёт
+     * @param array{array<int, int[]>, array<int, int[]>} $examined запертые
+     *        обходы до действия и после: раскладка меняется вместе с действием
+     * @param array{array<int, true>, array<int, true>} $aside вынесенное наружу
+     *        до действия и после
+     * @param Point2D[] $tangled
+     * @param array<int, Table> $tables
+     * @param Point2D[] $building
+     * @param Point2D[][] $moving
+     * @param array<int, array{int, int}> $edges
+     * @param int $frame кадр укладки, в который собирают
+     * @param array<int, int[]> $where шар => столы, на которых он побывал
+     *
+     * @return Scene[]
+     */
+    private function getStepScenes(
+        CutPlan $plan,
+        int $state,
+        Step $step,
+        array $built,
+        array $painted,
+        array $locked,
+        array $examined,
+        array $aside,
+        array $tangled,
+        array $tables,
+        float $spacing,
+        array $building,
+        array $moving,
+        array $edges,
+        int $frame,
+        array $where,
+    ): array {
+        // Расслабление начинается ровно там, где кончилась сборка: иначе
+        // картинка скакнёт назад, в разметку по дугам.
+        if ($step->action instanceof Relax) {
+            return $this->getMovingScenes($plan, $moving, $edges, $frame, count($moving) - 1);
         }
 
-        // Места раздаются в порядке сборки: очередь видна сразу, и уже
-        // разложенные куски не переставляются на глазах.
-        $result->orderSlots($order);
+        // Пока обход заперт, он лежит на среднем круге: видно, про что
+        // спрашивают. Разрез запор снимает, поэтому после действия запертого
+        // уже нет — и грань уезжает с того самого круга.
+        $before = $this->getPlaces($plan, $state - 1, $tangled, $tables, $spacing, $examined[0], $aside[0], $where);
+        $after = $this->getPlaces($plan, $state, $tangled, $tables, $spacing, $examined[1], $aside[1], $where);
+        // Надрез виден в тот момент, когда режут, а не когда отрезанное
+        // доехало до своего места: это же и есть разрез.
+        $shift = $painted === [] ? 0 : max($painted) + 1;
+        $isHalf = $this->getHalfGroups($plan, $state, $after)
+            + $this->getFieldGroups($plan, $state, $after, $shift)
+            + $this->getFillGroups($after, $painted);
+        $wasHalf = $this->getHalfGroups($plan, $state, $before)
+            + $this->getFieldGroups($plan, $state, $before, $shift)
+            + $this->getFillGroups($before, $painted);
+        $ties = $plan->getTies();
+        $kind = $step->kind ?? StageKind::Graph;
+
+        if ($step->action instanceof Build) {
+            return [$this->getBuildScene($plan, $after, $kind, $built, $building, $isHalf)];
+        }
+
+        if ($step->action instanceof Paint) {
+            return [$this->getPaintedScene($after, $step->action, $isHalf, $ties)];
+        }
+
+        // Вопрос клубок не меняет, но кадр ему нужен: без запирания заливка
+        // потом останавливается непонятно почему.
+        $shows = $step->action->isQuestion();
+
+        if (! $shows && ! $plan->isChanged($state)) {
+            return [];
+        }
+
+        $marked = $this->getMarkKeys($plan, $state, $before, $step);
+        // Поле не просто обводится — оно заливается своим цветом, и краска
+        // приходит по связям, как в самой первой заливке. Заливка в рассказе
+        // одна, меняется только то, что заливают.
+        $cuts = [];
+        $tie = null;
+
+        foreach ($step->actions() as $action) {
+            if ($action instanceof Cut) {
+                $cuts[] = $action->walk;
+            }
+
+            // Связку тянут не куда попало: от точки сочленения отмеряют
+            // по половине каждой грани. Отмер и показывается — иначе палка
+            // берётся ниоткуда, и вместо логики выходит фокус.
+            $tie ??= $action instanceof Tie ? $action : null;
+        }
+
+        $filling = match (true) {
+            $cuts !== [] => $this->getFillingScenes($plan, $state, $before, $cuts, $marked, $wasHalf, $ties, $shift),
+            $tie !== null => $this->getMeasuringScenes($plan, $state, $before, $tie, $wasHalf, $ties),
+            default => [],
+        };
+
+        return array_merge(
+            $filling !== [] ? $filling : ($marked === [] ? [] : $this->getMarkedScenes($before, $marked, $step->marked ?? $kind, $wasHalf, $ties)),
+            [$this->getScene($after, $kind, $isHalf, [], [], self::ACT_WEIGHT, [], $ties)],
+        );
+    }
+
+    /**
+     * Как поле заливается своим цветом: краска обходит контур по связям.
+     *
+     * Это та же заливка, что искала куски графа в начале, — просто теперь
+     * заливают поле. Шар закрашен, дальше по палке от него ползёт полоса того
+     * же цвета и доходит до соседа ровно к следующему кадру, тогда сосед и
+     * становится закрашенным. Когда обойдён весь контур, поле стоит целиком
+     * закрашенным — и следующим кадром его вырезают.
+     *
+     * Мгновенная перекраска не годится: граф на глазах красится второй раз,
+     * и непонятно, при чём тут первая заливка. А так видно, что это одно
+     * и то же действие над разными вещами.
+     *
+     * @param Places $places
+     * @param array<int, int[]> $walks обходы полей, которые режут прямо сейчас
+     * @param array<string, true> $marked
+     * @param array<string, int> $groups
+     * @param array<string, true> $ties
+     *
+     * @return Scene[]
+     */
+    private function getFillingScenes(
+        CutPlan $plan,
+        int $state,
+        Places $places,
+        array $walks,
+        array $marked,
+        array $groups,
+        array $ties,
+        int $shift,
+    ): array {
+        // Полей режут столько, сколько кусков разбирают одновременно, и у
+        // каждого свой цвет: тот, с каким оно ляжет на своё место.
+        $colors = [];
+
+        foreach ($plan->getState($state)['acted'] as $number => $acted) {
+            $place = $plan->getState($state)['places'][$acted] ?? null;
+
+            if ($place !== null && $place !== CutPlan::HOME && isset($walks[$number])) {
+                $colors[$number] = $place + $shift;
+            }
+        }
+
+        $waves = [];
+        $length = 0;
+
+        foreach ($colors as $number => $color) {
+            $waves[$number] = $this->getWaves($walks[$number]);
+            $length = max($length, count($waves[$number]));
+        }
+
+        if ($length === 0) {
+            return [];
+        }
+
+        $painted = [];
+        $result = [];
+        // Кольца остаются на шарах, а палки обводкой не закрашиваются: обводка
+        // перебила бы цвет, ради которого всё и делается. Контур поля и так
+        // виден — по краске, которая по нему ползёт.
+        $rings = array_filter(
+            $marked,
+            static fn (string $key): bool => ! str_contains($key, '-'),
+            ARRAY_FILTER_USE_KEY,
+        );
+
+        for ($number = 0; $number < $length; $number++) {
+            $flows = [];
+
+            foreach ($colors as $track => $color) {
+                $wave = $waves[$track][$number] ?? null;
+
+                if ($wave === null) {
+                    continue;
+                }
+
+                foreach ($wave as $vertex) {
+                    $painted[$vertex] = $color;
+                }
+
+                // Краска ползёт по тем палкам, по которым она в этот кадр и
+                // пришла: от волны, закрашенной в прошлом кадре, к той, что
+                // закрашивается сейчас. Так же, как в первой заливке.
+                $flows = array_merge(
+                    $flows,
+                    $this->getWaveFlows($places, $marked, $waves[$track][$number - 1] ?? [], $wave, $color),
+                );
+            }
+
+            $result[] = $this->getScene(
+                $places,
+                StageKind::Field,
+                $this->getPaintedKeys($places, $painted, $marked) + $groups,
+                $rings,
+                [],
+                self::MARK_WEIGHT,
+                $flows,
+                $ties,
+            );
+        }
 
         return $result;
     }
 
     /**
-     * Кадры одного шага.
+     * Как отмеряют место для связки: от точки сочленения обвод ползёт
+     * по половине каждой из двух сошедшихся граней, шаг за шагом, и там,
+     * где обе дорожки останавливаются, в следующем кадре появляется палка.
      *
-     * Состояние с номером шага — это то, что стало после него; предыдущее —
-     * то, что было до. Поэтому выделение показывается на «до», а действие —
-     * на «после», и шаг, на котором ничего не изменилось, действия не получает.
+     * Без этого связка берётся ниоткуда: только что были две грани — и вдруг
+     * между двумя случайными на вид шарами протянут пунктир. А правило тут
+     * простое и целиком видимое: полграни туда, полграни сюда, соединить
+     * концы. Алгоритм — чистая логика, и она должна читаться с картинки.
      *
-     * @param array<int, int> $order вершина => каким по счёту шагом её уложат
-     * @param Point2D[] $tangled
-     * @param array<int, array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D}> $tables
-     * @param Point2D[] $building
+     * @param Places $places
+     * @param array<string, int> $groups
+     * @param array<string, true> $ties
      *
      * @return Scene[]
      */
-    private function getStageScenes(
-        CutPlan $plan,
-        int $number,
-        Stage $stage,
-        array $order,
-        int $step,
-        array $tangled,
-        array $tables,
-        float $spacing,
-        array $building,
-    ): array {
-        $before = $this->getPlaces($plan, $number, $tangled, $tables, $spacing);
-        $after = $this->getPlaces($plan, $number + 1, $tangled, $tables, $spacing);
-        // Надрез виден в тот момент, когда режут, а не когда отрезанное
-        // доехало до своего места: это же и есть разрез.
-        $isHalf = $this->getHalfGroups($plan, $number + 1, $after);
-        $wasHalf = $this->getHalfGroups($plan, $number + 1, $before);
-        $isHalf += $this->getFieldGroups($plan, $number + 1, $after);
-        $wasHalf += $this->getFieldGroups($plan, $number + 1, $before);
-        $act = $plan->isChanged($number + 1) || $stage->kind === StageKind::Faces
-            ? [$this->getScene($after, $stage->kind, $isHalf, [], [], self::ACT_WEIGHT)]
-            : [];
+    private function getMeasuringScenes(CutPlan $plan, int $state, Places $places, Tie $action, array $groups, array $ties): array
+    {
+        $touched = $plan->getTouched($state);
+        $length = 0;
 
-        return match ($stage->kind) {
-            StageKind::Graph => [$this->getScene($after, $stage->kind, $isHalf, [], [], self::ACT_WEIGHT)],
-            StageKind::Fill => [$this->getPaintedScene($after, $stage, $isHalf)],
-            StageKind::ArticulationVertexes => $stage->highlight === []
-                ? []
-                : [$this->getMarkedScene($before, $this->getKeysOf($before, $stage->highlight), $stage->kind, $wasHalf)],
-            StageKind::Field, StageKind::OuterFace => array_merge(
-                $stage->highlight === []
-                    ? []
-                    : [$this->getMarkedScene($before, $this->getActedKeys($plan, $number + 1, $before, $stage), $stage->kind, $wasHalf)],
-                $act,
+        foreach ($action->paths as $path) {
+            $length = max($length, count($path));
+        }
+
+        if ($touched === [] || $length < 2) {
+            return [];
+        }
+
+        $result = [];
+
+        for ($step = 1; $step < $length; $step++) {
+            $marked = [];
+
+            foreach ($action->paths as $path) {
+                $walked = array_slice($path, 0, $step + 1);
+
+                foreach ($walked as $number => $vertex) {
+                    $this->addKey($marked, $plan, $places, $touched, $vertex, $walked[$number - 1] ?? null);
+                }
+            }
+
+            $result[] = $this->getScene(
+                $places,
+                StageKind::Tie,
+                $groups,
+                $marked,
+                [],
+                self::MARK_WEIGHT,
+                [],
+                $ties,
+            );
+        }
+
+        return $result;
+    }
+
+    /**
+     * Отметить шар, а заодно и палку, по которой до него дошли.
+     *
+     * @param array<string, true> $marked
+     * @param Places $places
+     * @param int[] $touched
+     */
+    private function addKey(array &$marked, CutPlan $plan, Places $places, array $touched, int $vertex, ?int $previous): void
+    {
+        foreach ($touched as $id) {
+            $key = $places->pieces[$id][$vertex] ?? null;
+
+            if ($key !== null) {
+                $marked[$key] = true;
+            }
+
+            if ($previous === null) {
+                continue;
+            }
+
+            $edge = $plan->getCutout($id)->edges[Scene::edgeName($vertex, $previous)] ?? null;
+
+            if ($edge !== null && isset($places->edges[$edge])) {
+                $marked[$edge] = true;
+            }
+        }
+    }
+
+    /**
+     * Волны обхода контура: с какого шара начали и куда краска доползла
+     * на каждом шаге. Идёт она в обе стороны сразу, как по любому графу.
+     *
+     * @param int[] $walk
+     *
+     * @return array<int, int[]>
+     */
+    private function getWaves(array $walk): array
+    {
+        $neighbours = [];
+
+        foreach (Piece::ofWalk($walk)->edges as [$vertexA, $vertexB]) {
+            $neighbours[$vertexA][$vertexB] = $vertexB;
+            $neighbours[$vertexB][$vertexA] = $vertexA;
+        }
+
+        if ($neighbours === []) {
+            return [];
+        }
+
+        $seen = [];
+        $wave = [$walk[0] ?? array_key_first($neighbours)];
+        $result = [];
+
+        while ($wave !== []) {
+            $result[] = $wave;
+            $next = [];
+
+            foreach ($wave as $vertex) {
+                $seen[$vertex] = true;
+            }
+
+            foreach ($wave as $vertex) {
+                foreach ($neighbours[$vertex] ?? [] as $neighbour) {
+                    if (! isset($seen[$neighbour])) {
+                        $next[$neighbour] = $neighbour;
+                    }
+                }
+            }
+
+            $wave = array_values($next);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Закрашенные экземпляры: шары и палки между двумя закрашенными.
+     * Берутся только те, что принадлежат заливаемому полю, — красят его,
+     * а не все копии этих шаров по столу.
+     *
+     * @param Places $places
+     * @param array<int, int> $painted
+     * @param array<string, true> $marked
+     *
+     * @return array<string, int>
+     */
+    private function getPaintedKeys(Places $places, array $painted, array $marked): array
+    {
+        $result = [];
+
+        foreach ($places->pieces as $vertexes) {
+            foreach ($vertexes as $vertex => $key) {
+                if (isset($marked[$key], $painted[$vertex])) {
+                    $result[$key] = $painted[$vertex];
+                }
+            }
+        }
+
+        foreach ($places->edges as $key => [$from, $to]) {
+            if (isset($marked[$key], $painted[Scene::vertexOf($from)], $painted[Scene::vertexOf($to)])) {
+                $result[$key] = $painted[Scene::vertexOf($from)];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Куда краска ползёт на этом кадре: по палкам от уже закрашенного шара
+     * к тому, который закрасится следующим.
+     *
+     * @param Places $places
+     * @param array<string, true> $marked
+     * @param int[] $was шары, закрашенные прошлым кадром: оттуда краска и идёт
+     * @param int[] $now шары, которые закрашиваются сейчас
+     *
+     * @return array<string, array{string, int}>
+     */
+    private function getWaveFlows(Places $places, array $marked, array $was, array $now, int $color): array
+    {
+        $source = array_flip($was);
+        $target = array_flip($now);
+        $result = [];
+
+        foreach ($places->edges as $key => [$from, $to]) {
+            if (! isset($marked[$key])) {
+                continue;
+            }
+
+            $one = Scene::vertexOf($from);
+            $two = Scene::vertexOf($to);
+
+            if (isset($source[$one], $target[$two])) {
+                $result[$key] = [$from, $color];
+            } elseif (isset($source[$two], $target[$one])) {
+                $result[$key] = [$to, $color];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Что обводят перед действием: названные шары и палки между ними — у тех
+     * кусков, с которыми действие и работает.
+     *
+     * Палки обводятся вместе с шарами, и без них обвод бесполезен: в клубке
+     * шары одного поля разбросаны по всей окружности, и четыре кольца на них
+     * читаются как четыре случайные точки. Поле видно только тогда, когда
+     * загорается его контур.
+     *
+     * Обводятся именно тронутые куски, а не все: тот же шар может лежать копией
+     * в другом куске на другом конце стола, и с ним сейчас ничего не делают.
+     *
+     * @param Places $places
+     *
+     * @return array<string, true>
+     */
+    private function getMarkKeys(CutPlan $plan, int $state, Places $places, Step $step): array
+    {
+        $marks = $step->marks;
+        $touched = $plan->getTouched($state);
+        $result = $touched === [] ? $this->getKeysOf($places, $marks) : [];
+
+        foreach ($touched as $id) {
+            foreach ($marks as $vertex) {
+                $key = $places->pieces[$id][$vertex] ?? null;
+
+                if ($key !== null) {
+                    $result[$key] = true;
+                }
+            }
+
+            foreach ($this->getMarkedEdges($step->action) as [$vertexA, $vertexB]) {
+                $key = $plan->getCutout($id)->edges[Scene::edgeName($vertexA, $vertexB)] ?? null;
+
+                if ($key !== null && isset($places->edges[$key])) {
+                    $result[$key] = true;
+                }
+            }
+        }
+
+        return $result === [] ? $this->getKeysOf($places, $marks) : $result;
+    }
+
+    /**
+     * Какие палки входят в обводимое: контур грани, которую сейчас режут или
+     * сдвигают. У «отделить» и «связать» контура нет — там обводят сам шов
+     * и сами два шара.
+     *
+     * @return array<int, array{int, int}>
+     */
+    private function getMarkedEdges(ActionInterface $action): array
+    {
+        if ($action instanceof Together) {
+            $result = [];
+
+            foreach ($action->actions as $item) {
+                $result = array_merge($result, $this->getMarkedEdges($item));
+            }
+
+            return $result;
+        }
+
+        return match (true) {
+            $action instanceof Cut => Piece::ofWalk($action->walk)->edges,
+            $action instanceof Join => array_merge(
+                Piece::ofWalk($action->first)->edges,
+                Piece::ofWalk($action->second)->edges,
             ),
-            StageKind::Components, StageKind::Branches, StageKind::Order, StageKind::Faces => $act,
-            StageKind::Build => [$this->getBuildScene($plan, $after, $stage, $order, $step, $building, $isHalf)],
+            $action instanceof Show => Piece::ofWalk($action->vertexes)->edges,
             default => [],
         };
     }
@@ -217,17 +775,20 @@ final readonly class StoryService
      * экземпляры достались частям.
      *
      * @param Point2D[] $tangled
-     * @param array<int, array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D}> $tables
-     *
-     * @return array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>}
+     * @param array<int, Table> $tables
+     * @param array<int, int[]> $locked запертые обходы по столам: каждый
+     *                                   уходит в середину своего стола
+     * @param array<int, true> $aside вынесенное наружу: на внешний круг
+     * @param array<int, int[]> $visited шар => столы, на которых он побывал
      */
-    private function getPlaces(CutPlan $plan, int $number, array $tangled, array $tables, float $spacing): array
+    private function getPlaces(CutPlan $plan, int $number, array $tangled, array $tables, float $spacing, array $locked = [], array $aside = [], array $visited = []): Places
     {
         $state = $plan->getState($number);
         $live = array_flip($state['live']);
         $positions = [];
         $pieces = [];
         $hosts = [];
+        $waiting = [];
 
         foreach ($state['live'] as $id) {
             $cutout = $plan->getCutout($id);
@@ -235,12 +796,29 @@ final readonly class StoryService
             $table = $tables[$plan->getTable($id)] ?? null;
             $points = $table === null || $place === CutPlan::HOME
                 ? $this->getHomePoints($cutout->piece, $tangled, $table)
-                : $this->getRingPoints($cutout->piece, $table['slots'][$place] ?? new Point2D(), $spacing);
+                : $this->place->getWheel(
+                    $cutout->piece->vertexes,
+                    $table->slot($place),
+                    $this->place->getPieceRadius(count($cutout->piece->vertexes), $spacing),
+                );
             $hosts[$id] = $id;
 
             foreach ($points as $vertex => $point) {
                 $positions[$cutout->vertexes[$vertex]] = $point;
                 $pieces[$id][$vertex] = $cutout->vertexes[$vertex];
+            }
+        }
+
+        // У какого живого куска сейчас лежит каждый шар. Считается один раз
+        // на состояние: раньше это был перебор живых кусков на каждый шар
+        // каждой копии, то есть куб от размера графа. На семи колёсах в семи
+        // кусках он и съедал всё время — двадцать минут на кадры при десяти
+        // секундах на сам алгоритм.
+        $holders = [];
+
+        foreach ($state['live'] as $id) {
+            foreach ($plan->getCutout($id)->vertexes as $vertex => $key) {
+                $holders[$vertex] ??= $id;
             }
         }
 
@@ -258,129 +836,262 @@ final readonly class StoryService
             $hosts[$id] = $host;
 
             foreach ($cutout->piece->vertexes as $vertex) {
+                $own = $cutout->vertexes[$vertex];
                 $key = $plan->getCutout($host)->vertexes[$vertex] ?? null;
+                $where = $key !== null && isset($positions[$key]) ? $host : null;
+                // Копия, заведённая для будущего разреза, ждёт поверх своего
+                // шара — где бы он сейчас ни лежал.
+                $where ??= $holders[$vertex] ?? null;
 
-                if ($key === null || ! isset($positions[$key])) {
+                if ($where === null) {
                     continue;
                 }
 
-                $positions[$cutout->vertexes[$vertex]] = $positions[$key];
-                $pieces[$id][$vertex] = $cutout->vertexes[$vertex];
+                $point = $positions[$plan->getCutout($where)->vertexes[$vertex]] ?? null;
+
+                if ($point === null) {
+                    continue;
+                }
+
+                $positions[$own] ??= $point;
+                $pieces[$id][$vertex] = $own;
+                $waiting[$id][$vertex] = $where;
+            }
+        }
+
+        // Слившийся при объединении шар остаётся лежать поверх того, в который
+        // слился: шаров стало меньше, а из кадра ничего не пропало.
+        foreach ($plan->getAbsorbed() as $key => $into) {
+            $point = $positions[$into] ?? null;
+
+            while ($point === null && isset($plan->getAbsorbed()[$into])) {
+                $into = $plan->getAbsorbed()[$into];
+                $point = $positions[$into] ?? null;
+            }
+
+            if ($point !== null) {
+                $positions[$key] ??= $point;
             }
         }
 
         $edges = [];
+        $ties = $plan->getTies();
 
         foreach ($pieces as $id => $vertexes) {
             $cutout = $plan->getCutout($id);
+            $born = $plan->getBirth($id) <= $number;
 
             foreach ($cutout->piece->edges as [$vertexA, $vertexB]) {
-                if (isset($vertexes[$vertexA], $vertexes[$vertexB])) {
-                    $edges[$cutout->edges[Scene::edgeName($vertexA, $vertexB)]] = [$vertexes[$vertexA], $vertexes[$vertexB]];
+                $key = $cutout->edges[Scene::edgeName($vertexA, $vertexB)];
+
+                // Связка появляется вместе со склейкой, которая её и добавила:
+                // раньше её в графе просто нет. А ребро, которое уже рисует
+                // живой кусок, ему и принадлежит: грань, которую только
+                // склеят, иначе растянула бы его через весь стол.
+                if (! isset($vertexes[$vertexA], $vertexes[$vertexB])
+                    || isset($edges[$key])
+                    || (isset($ties[$key]) && ! $born)
+                ) {
+                    continue;
                 }
+
+                // Кусок, которого ещё нет, ждёт поверх живых. Если его концы
+                // ждут на разных кусках, ребро между ними растянулось бы через
+                // весь стол, поэтому оно сжимается в точку и прячется под
+                // своим шаром: из кадра не пропало, а показывать его нечего.
+                $split = ! $born && ($waiting[$id][$vertexA] ?? null) !== ($waiting[$id][$vertexB] ?? null);
+                $edges[$key] = [$vertexes[$vertexA], $split ? $vertexes[$vertexA] : $vertexes[$vertexB]];
             }
         }
 
-        return ['positions' => $positions, 'edges' => $edges, 'pieces' => $pieces, 'hosts' => $hosts];
+        return new Places(
+            positions: $this->getLifted($positions, $pieces, $hosts, $plan, $state, $tables, $locked, $aside, $visited),
+            edges: $edges,
+            pieces: $pieces,
+            hosts: $hosts,
+        );
     }
 
     /**
-     * Кусок у себя дома: вершины стоят по кругу своего стола, равномерно и
-     * в том же порядке, в каком стояли в клубке.
+     * На каких столах побывал каждый шар.
      *
-     * Равномерно — потому что кусок по ходу нарезки худеет: если оставлять
-     * вершины на прежних местах, от графа остаются редкие ошмётки с дырами.
-     * А порядок сохраняется, чтобы вершины не перемешивались.
+     * Считается один раз на весь рассказ. Раньше стол запертого обхода искали
+     * перебором: на каждый кадр — по всем кускам, по всем их шарам, да ещё
+     * `array_intersect`. Выходил четвёртый порядок от размера графа: на трёх
+     * кусках по семь колёс кадры считались две минуты, из них девяносто
+     * процентов в этом переборе.
      *
-     * @param Point2D[] $tangled
-     * @param ?array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D} $table
-     *
-     * @return Point2D[]
+     * @return array<int, int[]>
      */
-    private function getHomePoints(Piece $piece, array $tangled, ?array $table): array
+    private function getVertexTables(CutPlan $plan): array
     {
-        if ($table === null) {
-            return $this->getPoints($piece->vertexes, $tangled);
-        }
-
-        $center = $this->getCenter($tangled);
-        $angles = [];
-
-        foreach ($piece->vertexes as $vertex) {
-            $point = $tangled[$vertex] ?? $center;
-            $angles[$vertex] = atan2($point->y - $center->y, $point->x - $center->x);
-        }
-
-        asort($angles);
-        $count = count($angles);
-        $start = $count === 0 ? .0 : (float) reset($angles);
         $result = [];
-        $number = 0;
 
-        foreach (array_keys($angles) as $vertex) {
-            $angle = $start + 2 * M_PI * $number / max($count, 1);
-            $result[$vertex] = $count === 1
-                ? $table['center']
-                : new Point2D(
-                    $table['center']->x + $table['radius'] * cos($angle),
-                    $table['center']->y + $table['radius'] * sin($angle),
-                );
-            $number++;
+        foreach ($plan->getCutouts() as $id => $cutout) {
+            $table = $plan->getTable($id);
+
+            foreach ($cutout->piece->vertexes as $vertex) {
+                $result[$vertex][$table] = $table;
+            }
         }
 
         return $result;
     }
 
     /**
+     * Запертый обход уходит на средний круг, вынесенное — на внешний.
+     *
+     * Без этого запирание и заливка сливаются в кашу: непонятно, про что
+     * спрашивают и что именно ответила краска. А стоит вынуть обход из куска
+     * и положить отдельно, и видно, что заливка отвечает про него: вот это
+     * на нём висит, и вот это придётся вынести наружу.
+     *
+     * Где именно лежат эти круги, знает стол; здесь решается только, кто
+     * на каком из них оказался.
+     *
+     * @param array<string, Point2D> $positions
+     * @param array<int, array<int, string>> $pieces
+     * @param array<int, int> $hosts
+     * @param array{live: int[], places: array<int, int>, acted: int[], touched: int[], half: array<string, true>} $state
+     * @param array<int, Table> $tables
+     * @param array<int, int[]> $locked
+     * @param array<int, true> $aside
+     * @param array<int, int[]> $where шар => столы, на которых он побывал
+     *
+     * @return array<string, Point2D>
+     */
+    private function getLifted(array $positions, array $pieces, array $hosts, CutPlan $plan, array $state, array $tables, array $locked, array $aside, array $where): array
+    {
+        if ($locked === []) {
+            return $positions;
+        }
+
+        // У каждого стола своя раскладка: по тому обходу, который на нём
+        // запирали последним. Стол ищется по всему плану, а не по тому, что
+        // сейчас на нём лежит: после разреза запертого обхода на столе уже
+        // нет, и стол разом вернулся бы с кругов по домам.
+        $walks = [];
+
+        foreach ($locked as $walk) {
+            foreach ($walk as $vertex) {
+                foreach ($where[$vertex] ?? [] as $table) {
+                    $walks[$table] = $walk;
+                }
+            }
+        }
+        // Раскладывается по кругам только тот кусок, про который спрашивают.
+        // Остальные столы к этому вопросу отношения не имеют и стоят как
+        // стояли: иначе на каждом запирании перетряхивается вся картинка.
+        // Спрашивают про стол, а не про кусок: после разреза кусок заменяется
+        // остатком, и если привязываться к куску, остаток тут же прыгнет
+        // обратно по домам — а на кадре разреза должно ехать только
+        // отрезанное.
+
+        // Копии, ещё не отрезанные, лежат поверх своих хозяев — значит,
+        // и переезжать должны вместе с ними. Иначе оригинал уедет в середину,
+        // копия останется на кольце, и между ними протянется ребро через
+        // весь стол.
+        foreach ($pieces as $id => $vertexes) {
+            $host = $hosts[$id] ?? $id;
+
+            $walk = $walks[$plan->getTable($host)] ?? null;
+            $table = $tables[$plan->getTable($host)] ?? null;
+
+            if ($walk === null || $table === null
+                || ($state['places'][$host] ?? CutPlan::HOME) !== CutPlan::HOME
+            ) {
+                continue;
+            }
+
+            $order = array_flip(array_values(array_unique($walk)));
+            $count = max(count($order), 1);
+
+            foreach ($vertexes as $vertex => $key) {
+                if (! isset($positions[$key])) {
+                    continue;
+                }
+
+                if (isset($order[$vertex])) {
+                    $positions[$key] = $table->locked($order[$vertex], $count);
+
+                    continue;
+                }
+
+                // Остальные остаются где лежали: их никто не трогает, пока
+                // не решат, что они снаружи. Тогда — и только тогда — они
+                // уезжают наружу.
+                if (isset($aside[$vertex])) {
+                    $positions[$key] = $this->place->getOnRing($positions[$key], $table->center, $table->around());
+                }
+            }
+        }
+
+        return $positions;
+    }
+
+    /**
+     * Кусок у себя дома: ровным кругом на середине своего стола.
+     *
+     * Раньше остаток раскладывался по кругу заново после каждого разреза,
+     * чтобы не оставалось дыр. Но дыра — это как раз то, что надо показать:
+     * на её месте только что было поле, его и вырезали. А перекладка стоила
+     * дорого: на каждом разрезе уезжали четыре шара и шевелились сорок, и
+     * разрез тонул в этой ряби — «отрезали одно поле» читалось как «поехало
+     * всё». Едет только то, что режут; остальное стоит.
+     *
+     * Круг считается по тому, что в куске осталось, поэтому оставшиеся
+     * расходятся равномерно. Порядок берётся из клубка, чтобы вершины
+     * не перемешались, а поворот — из стола: он посчитан раз по всем его
+     * вершинам, иначе весь остаток проворачивался бы после каждого разреза.
+     *
+     * @param Point2D[] $tangled
+     *
+     * @return Point2D[]
+     */
+    private function getHomePoints(Piece $piece, array $tangled, ?Table $table): array
+    {
+        if ($table === null) {
+            return $this->place->getPoints($piece->vertexes, $tangled);
+        }
+
+        return $this->place->getCircle(
+            array_keys($this->place->getAngles($piece->vertexes, $tangled)),
+            $table->center,
+            $table->radius,
+            $table->turn,
+        );
+    }
+
+    /**
      * Переносит укладку на стол своего куска.
      *
+     * Вершина числится за всеми столами, на которых побывала, — и за общим,
+     * с которого всё начиналось, тоже. Считается самый поздний: столы заводят
+     * по мере того, как граф распадается, поэтому у куска стол новее, чем
+     * у целого графа. Если взять общий, оба куска уедут в одно место, а их
+     * поля останутся лежать вокруг чужих столов.
+     *
      * @param Point2D[] $frame
-     * @param array<int, array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D}> $tables
+     * @param array<int, Table> $tables
      *
      * @return Point2D[]
      */
     private function getShifted(array $frame, CutPlan $plan, array $tables): array
     {
-        $shifts = [];
+        $hosts = [];
+        ksort($tables);
 
         foreach ($tables as $table => $item) {
             foreach ($plan->getTableVertexes($table) as $vertex) {
-                $shifts[$vertex] = $item['shift'];
+                $hosts[$vertex] = $item;
             }
         }
 
         $result = [];
 
         foreach ($frame as $vertex => $point) {
-            $shift = $shifts[$vertex] ?? null;
-            $result[$vertex] = $shift === null
-                ? $point
-                : new Point2D($point->x + $shift->x, $point->y + $shift->y);
-        }
-
-        return $result;
-    }
-
-    /**
-     * Отрезанный кусок на своём месте: вершины по кругу в порядке обхода,
-     * поэтому поле выглядит многоугольником.
-     *
-     * @return Point2D[]
-     */
-    private function getRingPoints(Piece $piece, Point2D $center, float $spacing): array
-    {
-        $vertexes = array_values($piece->vertexes);
-        $count = count($vertexes);
-        $radius = $this->getPieceRadius($count, $spacing);
-        $result = [];
-
-        foreach ($vertexes as $position => $vertex) {
-            $result[$vertex] = $count === 1
-                ? $center
-                : new Point2D(
-                    $center->x + $radius * sin(2 * M_PI * $position / $count),
-                    $center->y - $radius * cos(2 * M_PI * $position / $count),
-                );
+            $table = $hosts[$vertex] ?? null;
+            $result[$vertex] = $table === null ? $point : $table->shifted($point);
         }
 
         return $result;
@@ -389,225 +1100,289 @@ final readonly class StoryService
     /**
      * Столы: у каждого несвязного куска свой.
      *
-     * На столе кусок лежит в середине, а вырезанное из него раскладывается
-     * по кругу вокруг. Столы стоят в ряд и не задевают друг друга, поэтому
-     * два несвязных графа не мешают друг другу ни при нарезке, ни при сборке:
-     * каждый собирается у себя.
-     *
-     * Размер стола считается по готовой укладке, а не по той, что была до
-     * расслабления: расслабленная шире, и если мерить по ней задним числом,
-     * куски вылезут на соседний стол.
+     * Сначала меряются все — размер стола зависит только от того, что на нём
+     * будет лежать. Потом решается, где какой стоит: это уже зависит от всех
+     * размеров сразу, потому что столы раскладываются по кольцу вокруг
+     * центрального и радиус кольца подбирается по ним. И только потом столы
+     * ставятся на места.
      *
      * @param Point2D[] $tangled
-     * @param Point2D[] $final готовая укладка
+     * @param Point2D[][] $layouts укладки: собранная, потом расслабление
      *
-     * @return array<int, array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D}>
+     * @return array<int, Table>
      */
-    private function getTables(CutPlan $plan, array $tangled, array $final, float $spacing): array
+    private function getTables(CutPlan $plan, array $tangled, array $layouts, float $spacing): array
     {
         $sizes = [];
 
         foreach ($plan->getTables() as $table) {
-            $vertexes = $plan->getTableVertexes($table);
-            $built = $this->getCenter($this->getPoints($vertexes, $final));
-            // Дома вершины стоят по кругу — ровно так, чтобы держать то же
-            // расстояние, что и в исходном клубке.
-            $home = $this->getPieceRadius(count($vertexes), $spacing);
-            $piece = $spacing;
-
-            foreach ($plan->getSlotted($table) as $cutout) {
-                $piece = max($piece, $this->getPieceRadius(count($cutout->piece->vertexes), $spacing));
-            }
-
-            $count = $plan->getSlotCount($table);
-            // Круг мест должен обходить и домашний круг, и собранную укладку,
-            // и быть достаточно большим, чтобы соседние куски на нём
-            // не задевали друг друга.
-            $outside = max($home, $this->getRadius($built, $this->getPoints($vertexes, $final)));
-            $ring = $count === 0
-                ? .0
-                : max($outside + $piece * self::RING_GAP, 1.2 * $count * $piece / M_PI + $piece);
-            $sizes[$table] = [
-                'built' => $built,
-                'home' => $home,
-                'ring' => $ring,
-                'count' => $count,
-                'extent' => max($ring + $piece, $outside),
-            ];
+            $sizes[$table] = $this->getTableSize($plan, $table, $tangled, $layouts, $spacing);
         }
 
         // Стол, с которого всё началось, стоит там же, где лежал клубок.
         // Если граф распался на несвязные куски, этот стол пустеет — каждый
-        // кусок уезжает на свой, и в ряд встают уже они.
-        $center = $this->getCenter($tangled);
-        $result = $this->getPlacedTables(
-            count($sizes) > 1 ? array_diff_key($sizes, [self::WHOLE_TABLE => true]) : $sizes,
-            $center,
-            $spacing,
-        );
+        // кусок уезжает на свой, и вокруг центрального встают уже они.
+        $center = $this->place->getCenter($tangled);
+        $centers = count($sizes) > 1
+            ? $this->getRingCenters(array_diff_key($sizes, [self::WHOLE_TABLE => true]), $center, $spacing)
+            : $this->getRowCenters($sizes, $center, $spacing);
+        $centers[self::WHOLE_TABLE] ??= $center;
+        $result = [];
 
-        if (! isset($result[self::WHOLE_TABLE])) {
-            $result[self::WHOLE_TABLE] = [
-                'center' => $center,
-                'radius' => $sizes[self::WHOLE_TABLE]['home'],
-                'slots' => [],
-                'shift' => new Point2D(
-                    $center->x - $sizes[self::WHOLE_TABLE]['built']->x,
-                    $center->y - $sizes[self::WHOLE_TABLE]['built']->y,
-                ),
-            ];
+        foreach ($centers as $table => $point) {
+            $result[$table] = $this->getTable($plan, $table, $sizes[$table], $tangled, $point);
         }
 
         return $result;
     }
 
     /**
-     * Ставит столы в ряд, слева направо в том же порядке, в каком куски стоят
-     * в готовой укладке, и считает для каждого его места.
+     * Сколько места надо одному столу.
      *
-     * @param array<int, array{built: Point2D, home: float, ring: float, count: int, extent: float}> $sizes
-     *
-     * @return array<int, array{center: Point2D, radius: float, slots: Point2D[], shift: Point2D}>
+     * @param Point2D[] $tangled
+     * @param Point2D[][] $layouts
      */
-    private function getPlacedTables(array $sizes, Point2D $center, float $spacing): array
+    private function getTableSize(CutPlan $plan, int $table, array $tangled, array $layouts, float $spacing): TableSize
     {
-        uasort($sizes, static fn (array $a, array $b): int => $a['built']->x <=> $b['built']->x);
+        $vertexes = $plan->getTableVertexes($table);
+        $final = $layouts[count($layouts) - 1] ?? [];
+        $built = $this->place->getCenter($this->place->getPoints($vertexes, $final));
+        // Дома вершины стоят по кругу — ровно так, чтобы держать то же
+        // расстояние, что и в исходном клубке.
+        $home = $this->place->getPieceRadius(count($vertexes), $spacing);
+        // У каждого места свой размер — по самому большому куску из тех, кто
+        // на нём побывает: место занимает целая цепочка, и ветвь на нём шире
+        // вырезанного из неё поля.
+        $radii = [];
+
+        foreach ($plan->getSlotted($table) as $id => $cutout) {
+            $place = $plan->getPlace($id);
+            $radii[$place] = max(
+                $radii[$place] ?? .0,
+                $this->place->getPieceRadius(count($cutout->piece->vertexes), $spacing),
+            );
+        }
+
+        ksort($radii);
+        // Круг мест должен обходить и домашний круг, и собранную укладку.
+        $outside = $home;
+
+        foreach ($layouts as $layout) {
+            $outside = max($outside, $this->place->getRadius($built, $this->place->getPoints($vertexes, $layout)));
+        }
+
+        $gap = $spacing * self::RING_GAP;
+        $ring = $this->place->getRing($radii, $outside, $gap);
+
+        return new TableSize(
+            built: $built,
+            tangled: $this->place->getCenter($this->place->getPoints($vertexes, $tangled)),
+            // Поворот домашнего круга считается один раз по всем вершинам
+            // стола: иначе остаток проворачивается после каждого разреза.
+            turn: $this->place->getTurn($this->place->getAngles($vertexes, $tangled)),
+            radius: $home,
+            ring: $ring,
+            angles: $this->place->getPlaces($radii, $ring, $gap),
+            extent: $radii === [] ? $outside : max($outside, $ring + max($radii)),
+        );
+    }
+
+    /**
+     * Один стол на своём месте.
+     *
+     * @param Point2D[] $tangled
+     */
+    private function getTable(CutPlan $plan, int $table, TableSize $size, array $tangled, Point2D $point): Table
+    {
+        $vertexes = $plan->getTableVertexes($table);
+        $slots = [];
+
+        foreach ($size->angles as $place => $angle) {
+            $slots[$place] = $this->place->getOnAngle($point, $size->ring, $angle);
+        }
+
+        return $size->at(
+            $point,
+            $this->place->getCircle(
+                array_keys($this->place->getAngles($vertexes, $tangled)),
+                $point,
+                $size->radius,
+                $size->turn,
+            ),
+            $slots,
+        );
+    }
+
+    /**
+     * Где стоят столы, когда их несколько: вокруг центрального.
+     *
+     * Так же, как вокруг ветви раскладываются вырезанные из неё поля: радиус
+     * подбирается так, чтобы все поместились, а угол берётся из клубка, чтобы
+     * по дороге куски не прошли друг сквозь друга. Центральный — тот, что
+     * остался последним: из него ничего не увозили, он и лежит там же, где
+     * лежал клубок.
+     *
+     * @param array<int, TableSize> $sizes
+     *
+     * @return array<int, Point2D>
+     */
+    private function getRingCenters(array $sizes, Point2D $center, float $spacing): array
+    {
+        $middle = max(array_keys($sizes));
+        $around = array_diff_key($sizes, [$middle => true]);
+        $radii = [];
+        $angles = [];
+
+        foreach ($around as $table => $size) {
+            $radii[$table] = $size->extent;
+            // Угол по клубку: кусок уезжает туда, где он и лежал.
+            $angles[$table] = atan2($size->tangled->y - $center->y, $size->tangled->x - $center->x);
+        }
+
+        // Между столами зазор шире, чем между полями на одном столе: столы
+        // живут дольше и на них ещё вырастут укладки.
+        $gap = $spacing * self::RING_GAP * 2;
+        $ring = $this->place->getRing($radii, $sizes[$middle]->extent + $gap, $gap);
+        asort($angles);
+        $places = array_values($this->place->getPlaces(array_intersect_key($radii, $angles), $ring, $gap));
+        $result = [$middle => $center];
+        $number = 0;
+
+        foreach (array_keys($angles) as $table) {
+            $result[$table] = $this->place->getOnAngle($center, $ring, $places[$number] ?? .0);
+            $number++;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Где стоят столы, когда он один: там же, где лежал клубок.
+     *
+     * Ряд остался с тех пор, когда несвязные куски разъезжались в строку.
+     * Порядок берётся из клубка, а не из готовой укладки: куски разъезжаются
+     * по столам прямо из клубка, и если стол левого куска окажется справа,
+     * они поменяются местами и на ходу пройдут друг сквозь друга.
+     *
+     * @param array<int, TableSize> $sizes
+     *
+     * @return array<int, Point2D>
+     */
+    private function getRowCenters(array $sizes, Point2D $center, float $spacing): array
+    {
+        uasort($sizes, static fn (TableSize $a, TableSize $b): int => $a->tangled->x <=> $b->tangled->x);
         $width = .0;
 
         foreach ($sizes as $size) {
-            $width += $size['extent'] * 2 + $spacing;
+            $width += $size->extent * 2 + $spacing;
         }
 
         $offset = $center->x - ($width - $spacing) / 2;
         $result = [];
 
         foreach ($sizes as $table => $size) {
-            $point = new Point2D($offset + $size['extent'], $center->y);
-            $offset += $size['extent'] * 2 + $spacing;
-            $slots = [];
-
-            for ($number = 0; $number < $size['count']; $number++) {
-                $angle = 2 * M_PI * $number / $size['count'];
-                $slots[] = new Point2D(
-                    $point->x + $size['ring'] * sin($angle),
-                    $point->y - $size['ring'] * cos($angle),
-                );
-            }
-
-            $result[$table] = [
-                'center' => $point,
-                'radius' => $size['home'],
-                'slots' => $slots,
-                'shift' => new Point2D($point->x - $size['built']->x, $point->y - $size['built']->y),
-            ];
+            $result[$table] = new Point2D($offset + $size->extent, $center->y + $size->extent);
+            $offset += $size->extent * 2 + $spacing;
         }
 
         return $result;
-    }
-
-    /**
-     * @param int[] $vertexes
-     * @param Point2D[] $coordinates
-     *
-     * @return Point2D[]
-     */
-    private function getPoints(array $vertexes, array $coordinates): array
-    {
-        $result = [];
-
-        foreach ($vertexes as $vertex) {
-            if (isset($coordinates[$vertex])) {
-                $result[$vertex] = $coordinates[$vertex];
-            }
-        }
-
-        return $result;
-    }
-
-    /**
-     * Насколько далеко точки уходят от центра.
-     *
-     * @param Point2D[] $points
-     */
-    private function getRadius(Point2D $center, array $points): float
-    {
-        $result = .0;
-
-        foreach ($points as $point) {
-            $result = max($result, sqrt(($point->x - $center->x) ** 2 + ($point->y - $center->y) ** 2));
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param Point2D[] $points
-     */
-    private function getCenter(array $points): Point2D
-    {
-        if ($points === []) {
-            return new Point2D();
-        }
-
-        $left = INF;
-        $right = -INF;
-        $top = INF;
-        $bottom = -INF;
-
-        foreach ($points as $point) {
-            $left = min($left, $point->x);
-            $right = max($right, $point->x);
-            $top = min($top, $point->y);
-            $bottom = max($bottom, $point->y);
-        }
-
-        return new Point2D(($left + $right) / 2, ($top + $bottom) / 2);
-    }
-
-    private function getPieceRadius(int $count, float $spacing): float
-    {
-        return $count < 2 ? $spacing / 2 : max($spacing, $spacing / (2 * sin(M_PI / $count)));
     }
 
     /**
      * Заливка: цвет расползается по связям, куски пока целы.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * Краска переползает по ребру от закрашенной вершины к следующей и в конце
+     * перехода доходит до неё — тогда-то вершина и становится закрашенной.
+     * Иначе видно только, что точки меняют цвет, а кто кого закрасил — нет.
+     * Закрашенным остаётся и само ребро: по нему краска и прошла.
+     *
+     * @param Places $places
      * @param array<string, int> $groups
+     * @param array<string, true> $ties
      */
-    private function getPaintedScene(array $places, Stage $stage, array $groups): Scene
+    private function getPaintedScene(Places $places, Paint $action, array $groups, array $ties = []): Scene
     {
+        $painted = $action->groups;
 
-        foreach ($stage->getVertexGroups() as $vertex => $group) {
+        foreach ($painted as $vertex => $group) {
             foreach ($this->getVertexKeys($places, $vertex) as $key) {
                 $groups[$key] = $group;
             }
         }
 
-        return $this->getScene($places, $stage->kind, $groups, [], [], self::WAVE_WEIGHT);
+        foreach ($places->edges as $key => [$from, $to]) {
+            $group = $painted[Scene::vertexOf($from)] ?? null;
+
+            if ($group !== null && $group === ($painted[Scene::vertexOf($to)] ?? null)) {
+                $groups[$key] = $group;
+            }
+        }
+
+        $flows = [];
+
+        foreach ($action->flows as $target => $source) {
+            $edge = $this->getFlowEdge($places, $source, $target);
+
+            if ($edge !== null) {
+                $flows[$edge[0]] = [$edge[1], $painted[$target] ?? 0];
+            }
+        }
+
+        return $this->getScene($places, StageKind::Fill, $groups, [], [], self::WAVE_WEIGHT, $flows, $ties);
+    }
+
+    /**
+     * Ребро между двумя вершинами и тот его конец, с которого пришла краска.
+     *
+     * @param Places $places
+     *
+     * @return ?array{string, string} ребро и вершина, от которой красят
+     */
+    private function getFlowEdge(Places $places, int $source, int $target): ?array
+    {
+        foreach ($places->edges as $key => [$from, $to]) {
+            $one = Scene::vertexOf($from);
+            $two = Scene::vertexOf($to);
+
+            if ($one === $source && $two === $target) {
+                return [$key, $from];
+            }
+
+            if ($one === $target && $two === $source) {
+                return [$key, $to];
+            }
+        }
+
+        return null;
     }
 
     /**
      * Отрезанные поля лежат раскрашенными: каждое своим цветом, по месту
      * на столе — так соседние поля различимы, и видно, сколько их получилось.
-     * Цвет держится всё время, пока поле лежит, и сходит, когда поле
-     * возвращается в укладку.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * Красится поле не мгновенно: цвет приходит к нему заливкой, по связям,
+     * ровно так же, как красились куски графа в начале. Заливка в рассказе
+     * одна — меняется только то, что заливают.
+     *
+     * @param Places $places
      *
      * @return array<string, int>
      */
-    private function getFieldGroups(CutPlan $plan, int $number, array $places): array
+    private function getFieldGroups(CutPlan $plan, int $number, Places $places, int $shift): array
     {
-        $places['pieces'] = array_intersect_key($places['pieces'], array_flip($plan->getState($number)['live']));
+        $live = array_intersect_key($places->pieces, array_flip($plan->getState($number)['live']));
         $result = [];
 
-        foreach ($places['pieces'] as $id => $vertexes) {
+        foreach ($live as $id => $vertexes) {
             $place = $plan->getState($number)['places'][$id] ?? CutPlan::HOME;
 
             if ($place === CutPlan::HOME) {
                 continue;
             }
+
+            // Цвета полей идут после цветов заливки, иначе поле получит тот же
+            // цвет, каким закрашен кусок, и разрез сольётся с фоном.
+            $place += $shift;
 
             foreach ($vertexes as $key) {
                 $result[$key] = $place;
@@ -624,15 +1399,66 @@ final readonly class StoryService
     }
 
     /**
+     * Краска первой заливки — той, что искала куски графа.
+     *
+     * Цвет с куска не сходит: зелёное значит «весь граф оказался одним
+     * куском», и оно остаётся зелёным, пока кусок цел. Иначе заливка выходит
+     * бессмысленной: покрасили, а на первом же разрезе краска пропала.
+     *
+     * @param Places $places
+     * @param array<int, int> $painted
+     *
+     * @return array<string, int>
+     */
+    private function getFillGroups(Places $places, array $painted): array
+    {
+        if ($painted === []) {
+            return [];
+        }
+
+        $result = [];
+
+        foreach ($places->pieces as $vertexes) {
+            foreach ($vertexes as $vertex => $key) {
+                if (isset($painted[$vertex])) {
+                    $result[$key] = $painted[$vertex];
+                }
+            }
+        }
+
+        foreach ($places->edges as $key => [$from, $to]) {
+            $group = $painted[Scene::vertexOf($from)] ?? null;
+
+            if ($group !== null && $group === ($painted[Scene::vertexOf($to)] ?? null)) {
+                $result[$key] = $group;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Выделение: отмечаем то, с чем сейчас будем работать.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * @param Places $places
      * @param array<string, true> $marked
      * @param array<string, int> $groups
+     * @param array<string, true> $ties
+     *
+     * @return Scene[]
      */
-    private function getMarkedScene(array $places, array $marked, StageKind $kind, array $groups): Scene
+    private function getMarkedScenes(Places $places, array $marked, StageKind $kind, array $groups, array $ties = []): array
     {
-        return $this->getScene($places, $kind, $groups, $marked, [], self::MARK_WEIGHT);
+        // Кадр выделения идёт дважды подряд. Между двумя соседними кадрами
+        // картинка едет, поэтому одного кадра мало: кольцо зажглось бы ровно
+        // в тот момент, когда кусок уже поехал, и «выделил, потом сделал»
+        // превратилось бы в «выделил и сделал разом». Первый кадр — короткая
+        // пауза после прошлого действия, второй держит кольцо неподвижно,
+        // и только потом начинается движение.
+        return [
+            $this->getScene($places, $kind, $groups, $marked, [], self::BEAT_WEIGHT, [], $ties),
+            $this->getScene($places, $kind, $groups, $marked, [], self::MARK_WEIGHT, [], $ties),
+        ];
     }
 
     /**
@@ -640,16 +1466,16 @@ final readonly class StoryService
      * разреза. Ребро всегда режут ровно дважды, и по цвету видно, сколько
      * работы с ним осталось.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * @param Places $places
      *
      * @return array<string, int>
      */
-    private function getHalfGroups(CutPlan $plan, int $number, array $places): array
+    private function getHalfGroups(CutPlan $plan, int $number, Places $places): array
     {
         $result = [];
 
         foreach (array_keys($plan->getState($number)['half']) as $key) {
-            if (isset($places['edges'][$key])) {
+            if (isset($places->edges[$key])) {
                 $result[$key] = self::HALF_GROUP;
             }
         }
@@ -658,37 +1484,12 @@ final readonly class StoryService
     }
 
     /**
-     * Экземпляры того куска, который сейчас и отрежут: обводим именно его,
-     * а не все копии этих вершин по всему столу.
-     *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
-     *
-     * @return array<string, true>
-     */
-    private function getActedKeys(CutPlan $plan, int $number, array $places, Stage $stage): array
-    {
-        $acted = $plan->getState($number)['acted'];
-
-        if ($acted === null || ! isset($places['pieces'][$acted])) {
-            return $this->getKeysOf($places, $stage->highlight);
-        }
-
-        $result = [];
-
-        foreach ($places['pieces'][$acted] as $key) {
-            $result[$key] = true;
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * @param Places $places
      * @param int[] $vertexes
      *
      * @return array<string, true>
      */
-    private function getKeysOf(array $places, array $vertexes): array
+    private function getKeysOf(Places $places, array $vertexes): array
     {
         $result = [];
 
@@ -705,18 +1506,19 @@ final readonly class StoryService
      * Сборка: очередной кусок уезжает на своё место в укладке целиком,
      * остальные ждут на столе приглушёнными.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
-     * @param array<int, int> $order
+     * @param Places $places
+     * @param int[] $built куски, которые уже уложены
      * @param Point2D[] $building
      * @param array<string, int> $groups
      */
-    private function getBuildScene(CutPlan $plan, array $places, Stage $stage, array $order, int $step, array $building, array $groups): Scene
+    private function getBuildScene(CutPlan $plan, Places $places, StageKind $kind, array $built, array $building, array $groups): Scene
     {
-        $positions = $places['positions'];
+        $positions = $places->positions;
         $faded = [];
+        $ready = array_flip($built);
 
-        foreach ($places['pieces'] as $id => $vertexes) {
-            $built = $plan->getRank($places['hosts'][$id] ?? $id, $order) <= $step;
+        foreach ($places->pieces as $id => $vertexes) {
+            $built = isset($ready[$places->hosts[$id] ?? $id]);
 
             foreach ($vertexes as $vertex => $key) {
                 if ($built && isset($building[$vertex])) {
@@ -740,7 +1542,7 @@ final readonly class StoryService
 
         $edges = [];
 
-        foreach ($places['edges'] as $key => [$from, $to]) {
+        foreach ($places->edges as $key => [$from, $to]) {
             $edges[$key] = [$positions[$from], $positions[$to]];
 
             if (isset($faded[$from]) || isset($faded[$to])) {
@@ -754,108 +1556,21 @@ final readonly class StoryService
             groups: $groups,
             faded: $faded,
             weight: self::ACT_WEIGHT,
-            kind: $stage->kind,
+            kind: $kind,
+            ties: $plan->getTies(),
         );
     }
 
     /**
-     * Кадр с сохранённым выделением: кольцо не гаснет, пока не сделано то,
-     * ради чего выделяли.
-     *
-     * @param int[] $vertexes
-     */
-    private function withMark(Scene $scene, array $vertexes): Scene
-    {
-        $marked = array_flip($vertexes);
-        $highlight = $scene->highlight;
-
-        foreach (array_keys($scene->vertexes) as $key) {
-            if (isset($marked[Scene::vertexOf($key)])) {
-                $highlight[$key] = true;
-            }
-        }
-
-        return new Scene(
-            vertexes: $scene->vertexes,
-            edges: $scene->edges,
-            groups: $scene->groups,
-            highlight: $highlight,
-            faded: $scene->faded,
-            weight: $scene->weight,
-            kind: $scene->kind,
-        );
-    }
-
-    /**
-     * Сколько раз каждое ребро ещё предстоит отрезать.
-     *
-     * Ребро лежит ровно между двумя полями, поэтому его режут дважды:
-     * по разу с каждой стороны.
-     *
-     * @param array<int, array{int, int}> $edges
-     * @param Stage[] $stages
-     *
-     * @return array<string, int>
-     */
-    private function getCutCount(array $edges, array $stages): array
-    {
-        $result = [];
-
-        foreach ($edges as [$vertexA, $vertexB]) {
-            $result[Scene::edgeName($vertexA, $vertexB)] = 0;
-        }
-
-        foreach ($stages as $stage) {
-            if ($stage->kind !== StageKind::Field) {
-                continue;
-            }
-
-            foreach (Piece::ofWalk($stage->highlight)->edges as [$vertexA, $vertexB]) {
-                $name = Scene::edgeName($vertexA, $vertexB);
-                $result[$name] = ($result[$name] ?? 0) + 1;
-            }
-        }
-
-        return $result;
-    }
-
-    /**
-     * Каким по счёту шагом построения ляжет каждая вершина.
-     *
-     * @param Stage[] $stages
-     *
-     * @return array<int, int>
-     */
-    private function getBuildOrder(array $stages): array
-    {
-        $result = [];
-        $step = 0;
-
-        foreach ($stages as $stage) {
-            if ($stage->kind !== StageKind::Build) {
-                continue;
-            }
-
-            foreach ($stage->groups[0] ?? [] as $vertex) {
-                $result[$vertex] ??= $step;
-            }
-
-            $step++;
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * @param Places $places
      *
      * @return string[]
      */
-    private function getVertexKeys(array $places, int $vertex): array
+    private function getVertexKeys(Places $places, int $vertex): array
     {
         $result = [];
 
-        foreach ($places['pieces'] as $piece) {
+        foreach ($places->pieces as $piece) {
             if (isset($piece[$vertex])) {
                 $result[] = $piece[$vertex];
             }
@@ -865,27 +1580,39 @@ final readonly class StoryService
     }
 
     /**
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
+     * @param Places $places
      * @param array<string, int> $groups
      * @param array<string, true> $marked
      * @param array<string, true> $faded
+     * @param array<string, array{string, int}> $flows
+     * @param array<string, true> $ties
      */
-    private function getScene(array $places, StageKind $kind, array $groups, array $marked, array $faded, float $weight): Scene
-    {
+    private function getScene(
+        Places $places,
+        StageKind $kind,
+        array $groups,
+        array $marked,
+        array $faded,
+        float $weight,
+        array $flows = [],
+        array $ties = [],
+    ): Scene {
         $edges = [];
 
-        foreach ($places['edges'] as $key => [$from, $to]) {
-            $edges[$key] = [$places['positions'][$from], $places['positions'][$to]];
+        foreach ($places->edges as $key => [$from, $to]) {
+            $edges[$key] = [$places->positions[$from], $places->positions[$to]];
         }
 
         return new Scene(
-            vertexes: $places['positions'],
+            vertexes: $places->positions,
             edges: $edges,
             groups: $groups,
             highlight: $marked,
             faded: $faded,
             weight: $weight,
             kind: $kind,
+            flows: $flows,
+            ties: $ties,
         );
     }
 
@@ -925,6 +1652,8 @@ final readonly class StoryService
                 // держать её ещё раз значит заморозить картинку перед самым
                 // интересным.
                 $position === 0 ? self::BEAT_WEIGHT : $weight,
+                [],
+                $plan->getTies(),
             );
         }
 
@@ -934,22 +1663,21 @@ final readonly class StoryService
     /**
      * Все экземпляры на местах своих вершин: разрезанное собрано обратно.
      *
-     * @param array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>} $places
      * @param Point2D[] $frame
-     *
-     * @return array{positions: array<string, Point2D>, edges: array<string, array{string, string}>, pieces: array<int, array<int, string>>, hosts: array<int, int>}
      */
-    private function getMergedPlaces(array $places, array $frame): array
+    private function getMergedPlaces(Places $places, array $frame): Places
     {
-        foreach ($places['pieces'] as $vertexes) {
+        $positions = $places->positions;
+
+        foreach ($places->pieces as $vertexes) {
             foreach ($vertexes as $vertex => $key) {
                 if (isset($frame[$vertex])) {
-                    $places['positions'][$key] = $frame[$vertex];
+                    $positions[$key] = $frame[$vertex];
                 }
             }
         }
 
-        return $places;
+        return new Places($positions, $places->edges, $places->pieces, $places->hosts);
     }
 
     /**

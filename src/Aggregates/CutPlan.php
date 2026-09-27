@@ -7,19 +7,26 @@ namespace EugeneErg\Graphs\Aggregates;
 use EugeneErg\Graphs\ValueObjects\Cutout;
 use EugeneErg\Graphs\ValueObjects\Piece;
 use EugeneErg\Graphs\ValueObjects\Scene;
+use EugeneErg\Graphs\ValueObjects\Script\ActionInterface;
+use EugeneErg\Graphs\ValueObjects\Script\Cut;
+use EugeneErg\Graphs\ValueObjects\Script\Detach;
+use EugeneErg\Graphs\ValueObjects\Script\Join;
+use EugeneErg\Graphs\ValueObjects\Script\Script;
+use EugeneErg\Graphs\ValueObjects\Script\Tie;
+use EugeneErg\Graphs\ValueObjects\Script\Together;
 
 /**
  * План разреза: что из чего вырезано, куда легло и какими экземплярами.
  *
- * План считается целиком заранее, до первого кадра, и в этом весь смысл.
+ * План — это исполнитель инструкции. Ему подают действия по одному
+ * (`apply`), он делает ровно это одно действие и запоминает состояние. Отсюда
+ * главное свойство рассказа: состояний ровно столько же, сколько действий,
+ * и слить два действия в один кадр нельзя — их просто нечем слить.
+ *
  * Место куска на столе и экземпляры его вершин назначаются один раз при
  * вырезании и больше не меняются: кусок никогда не переезжает из-за того, что
  * рядом отрезали другой, а экземпляр никогда не достаётся другому куску.
  * Иначе картинка превращается в паровозик, где при каждом разрезе едут все.
- *
- * После каждого шага алгоритма план запоминает состояние — какие куски живы и
- * где лежат. Отрисовке остаётся сравнить соседние состояния: если они
- * различаются, значит на этом шаге и правда что-то произошло.
  */
 final class CutPlan
 {
@@ -56,10 +63,26 @@ final class CutPlan
     /** @var array<string, true> экземпляры рёбер, разрезанных один раз из двух */
     private array $half = [];
 
-    /** @var array<int, array{live: int[], places: array<int, int>, acted: ?int, half: array<string, true>}> */
+    /** @var array<string, true> экземпляры связей, добавленных склейкой */
+    private array $ties = [];
+
+    /** @var array<string, true> сами связи: у них, как у рёбер, бывают копии */
+    private array $tieNames = [];
+
+    /**
+     * @var array<string, string> слившийся экземпляр => тот, в который он
+     *                            слился: шар остаётся лежать поверх него
+     */
+    private array $absorbed = [];
+
+    /** @var array<int, array{live: int[], places: array<int, int>, acted: int[], touched: int[], half: array<string, true>}> */
     private array $states = [];
 
-    private ?int $acted = null;
+    /** @var int[] куски, родившиеся на текущем действии */
+    private array $acted = [];
+
+    /** @var int[] куски, с которыми работает текущее действие */
+    private array $touched = [];
 
     /**
      * @param array<string, int> $cuts сколько раз каждое ребро ещё разрежут
@@ -72,7 +95,68 @@ final class CutPlan
     }
 
     /**
-     * Запомнить, как всё выглядит после очередного шага.
+     * Проиграть всю инструкцию: действие за действием.
+     *
+     * @param array<string, int> $cuts
+     */
+    public static function of(Piece $whole, array $cuts, Script $script): self
+    {
+        $result = new self($whole, $cuts);
+
+        foreach ($script->steps as $step) {
+            $result->apply($step->action);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Сделать ровно одно действие и запомнить, что получилось.
+     *
+     * Состояние на действие — это и есть то правило, ради которого заведена
+     * инструкция: кадров столько же, сколько действий, и склеить два действия
+     * в один кадр невозможно. Действия, которые клубок не трогают (показать,
+     * закрасить, уложить), состояние всё равно получают: рассказ идёт по ним
+     * так же, как по разрезам.
+     */
+    public function apply(ActionInterface $action): void
+    {
+        $this->touched = [];
+        $this->run($action);
+        $this->snapshot();
+    }
+
+    /**
+     * Сделать действие, не запоминая состояния.
+     *
+     * Одновременные действия (`Together`) — это по-прежнему один кадр:
+     * состояние снимается один раз на всех. Одновременны только чужие друг
+     * другу куски, поэтому порядок внутри ничего не решает.
+     */
+    private function run(ActionInterface $action): void
+    {
+        match (true) {
+            $action instanceof Detach => $this->detach($action->part, $action->rest, $action->table),
+            $action instanceof Cut => $this->cut(Piece::ofWalk($action->walk)),
+            $action instanceof Join => $this->join(Piece::ofWalk($action->first), Piece::ofWalk($action->second)),
+            $action instanceof Tie => $this->tie($action->edge, $action->walks),
+            $action instanceof Together => $this->runAll($action->actions),
+            default => null,
+        };
+    }
+
+    /**
+     * @param ActionInterface[] $actions
+     */
+    private function runAll(array $actions): void
+    {
+        foreach ($actions as $action) {
+            $this->run($action);
+        }
+    }
+
+    /**
+     * Запомнить, как всё выглядит после очередного действия.
      */
     public function snapshot(): void
     {
@@ -80,13 +164,14 @@ final class CutPlan
             'live' => $this->live,
             'places' => $this->places,
             'acted' => $this->acted,
+            'touched' => $this->touched,
             'half' => $this->half,
         ];
-        $this->acted = null;
+        $this->acted = [];
     }
 
     /**
-     * @return array{live: int[], places: array<int, int>, acted: ?int, half: array<string, true>}
+     * @return array{live: int[], places: array<int, int>, acted: int[], touched: int[], half: array<string, true>}
      */
     public function getState(int $number): array
     {
@@ -99,7 +184,7 @@ final class CutPlan
     }
 
     /**
-     * Изменилось ли что-нибудь на шаге, который привёл в это состояние.
+     * Изменилось ли что-нибудь на действии, которое привело в это состояние.
      */
     public function isChanged(int $number): bool
     {
@@ -107,6 +192,18 @@ final class CutPlan
         $after = $this->getState($number);
 
         return $before['live'] !== $after['live'] || $before['places'] !== $after['places'];
+    }
+
+    /**
+     * Куски, с которыми работало действие, приведшее в это состояние, — те,
+     * какими они были до него. На них и загорается кольцо: обводят ровно то,
+     * с чем сейчас будут работать, и ничего кроме.
+     *
+     * @return int[]
+     */
+    public function getTouched(int $number): array
+    {
+        return $this->getState($number)['touched'];
     }
 
     /**
@@ -135,6 +232,14 @@ final class CutPlan
     public function getTable(int $id): int
     {
         return $this->tables[$id];
+    }
+
+    /**
+     * Место куска на столе; CutPlan::HOME — там же, где лежал сам граф.
+     */
+    public function getPlace(int $id): int
+    {
+        return $this->places[$id];
     }
 
     /**
@@ -189,74 +294,104 @@ final class CutPlan
     }
 
     /**
-     * Разрезать кусок на части: первая остаётся на месте родителя, остальные
-     * уезжают на свои места. Общая вершина достаётся каждой части — своим
-     * экземпляром, поэтому связи между частями не остаётся.
+     * Отделить от куска одну часть.
      *
-     * @param array<int, int[]> $parts
-     * @param bool $tables развести части по своим столам: так расходятся
-     *                     несвязные куски, у каждого свой стол
+     * Ровно одну: разом отпустить все нельзя — глаз не успевает за тем, как
+     * полграфа одновременно разлетается в стороны, и непонятно, что именно
+     * от чего отрезали. Общая вершина достаётся и части, и остатку своим
+     * экземпляром, поэтому связи между ними не остаётся.
+     *
+     * Когда части разъезжаются по столам, свой стол получает и остаток —
+     * но только если он уже сам по себе целый кусок, а не набор тех, кого
+     * ещё предстоит развезти.
+     *
+     * @param int[] $part
+     * @param int[] $rest
      */
-    public function split(array $parts, bool $tables = false): void
+    private function detach(array $part, array $rest, bool $table): void
     {
-        $parts = array_values(array_filter($parts, static fn (array $item): bool => $item !== []));
-
-        if (count($parts) < 2) {
-            return;
-        }
-
-        $parent = $this->findByVertexes(array_merge(...$parts));
+        $parent = $part === [] || $rest === [] ? null : $this->findByVertexes(array_merge($part, $rest));
 
         if ($parent === null) {
             return;
         }
 
-        $place = $this->places[$parent];
-        $table = $this->tables[$parent];
-        $created = [];
-        $takenVertexes = [];
-        $takenEdges = [];
-
-        foreach ($parts as $number => $vertexes) {
-            $part = $this->getInduced($parent, $vertexes);
-            [$keptVertexes, $keptEdges] = $this->takeKeys($parent, $part, $takenVertexes, $takenEdges);
-            $created[] = $this->create(
-                $part,
-                $parent,
-                $tables ? $this->nextTable() : $table,
-                $tables || $number === 0 ? self::HOME : $this->nextSlot($table),
-                $keptVertexes,
-                $keptEdges,
-            );
-        }
+        $this->touched = [$parent];
+        $from = $this->cutouts[$parent];
+        $piece = $this->getInduced($parent, $part);
+        $left = $this->getInduced($parent, $rest);
+        // Остаток держит свои экземпляры, а всё, чего в нём не осталось,
+        // уезжает вместе с отрезанной частью.
+        $taken = $this->getKeysOutside($from, $left);
+        $cut = $this->create(
+            $piece,
+            $parent,
+            $table ? $this->nextTable() : $this->tables[$parent],
+            $table ? self::HOME : $this->nextSlot($this->tables[$parent]),
+            $taken[0],
+            $taken[1],
+        );
+        $kept = $this->getKeysInside($from, $left);
+        $keep = $this->create(
+            $left,
+            $parent,
+            $table && $this->isWhole($left) ? $this->nextTable() : $this->tables[$parent],
+            $table ? self::HOME : $this->places[$parent],
+            $kept[0],
+            $kept[1],
+        );
 
         $this->kill($parent);
-
-        foreach ($created as $id) {
-            $this->live[] = $id;
-        }
-
-        $this->acted = $created[1] ?? null;
+        $this->live[] = $cut;
+        $this->live[] = $keep;
+        $this->acted[] = $cut;
     }
 
     /**
-     * Вырезать поле из куска, в котором оно целиком лежит.
+     * Цел ли кусок: одна связная штука, а не несколько, которые ещё развезут.
+     */
+    private function isWhole(Piece $piece): bool
+    {
+        $seen = [];
+        $queue = array_slice($piece->vertexes, 0, 1);
+        $neighbours = [];
+
+        foreach ($piece->edges as [$vertexA, $vertexB]) {
+            $neighbours[$vertexA][] = $vertexB;
+            $neighbours[$vertexB][] = $vertexA;
+        }
+
+        while (($vertex = array_pop($queue)) !== null) {
+            if (isset($seen[$vertex])) {
+                continue;
+            }
+
+            $seen[$vertex] = true;
+
+            foreach ($neighbours[$vertex] ?? [] as $next) {
+                $queue[] = $next;
+            }
+        }
+
+        return count($seen) === count($piece->vertexes);
+    }
+
+    /**
+     * Разрезать кусок по замкнутому обходу.
      *
      * Ребро лежит ровно между двумя полями, поэтому из куска оно уходит только
      * после второго разреза: до тех пор у куска остаётся своя копия. Всё, чего
      * у куска после разреза не осталось, поле забирает вместе с экземплярами.
      */
-    public function cutOut(Piece $field): void
+    private function cut(Piece $field): void
     {
-        if ($field->edges === []) {
-            return;
-        }
-
-        $parent = $this->findByEdges($field);
+        $parent = $field->edges === [] ? null : $this->findByEdges($field);
 
         if ($parent === null) {
             return;
         }
+
+        $this->touched = [$parent];
 
         foreach ($field->edges as [$vertexA, $vertexB]) {
             $name = Scene::edgeName($vertexA, $vertexB);
@@ -280,7 +415,7 @@ final class CutPlan
         }
 
         $this->live[] = $cut;
-        $this->acted = $cut;
+        $this->acted[] = $cut;
 
         // Ребро лежит между двумя полями, и разрезают его дважды. После
         // первого разреза оно помечается: видно, какие рёбра уже надрезаны,
@@ -301,6 +436,159 @@ final class CutPlan
     }
 
     /**
+     * Сдвинуть две грани в одну: общий шар снова один, а тот его экземпляр,
+     * что достался второй грани, остаётся лежать поверх первого — ничто
+     * не пропадает.
+     */
+    private function join(Piece $firstPiece, Piece $secondPiece): void
+    {
+        $first = $this->findByPiece($firstPiece);
+        $second = $this->findByPiece($secondPiece);
+
+        if ($first === null || $second === null || $first === $second) {
+            return;
+        }
+
+        $this->touched = [$first, $second];
+        $edges = array_merge($this->cutouts[$first]->piece->edges, $this->cutouts[$second]->piece->edges);
+        $vertexes = [];
+        $keptEdges = [];
+
+        foreach ([$first, $second] as $source) {
+            foreach ($this->cutouts[$source]->vertexes as $vertex => $key) {
+                $vertexes[$vertex] ??= $key;
+            }
+
+            foreach ($this->cutouts[$source]->edges as $name => $key) {
+                $keptEdges[$name] ??= $key;
+            }
+        }
+
+        $id = $this->create(
+            Piece::ofEdges($edges),
+            $first,
+            $this->tables[$first],
+            $this->places[$first],
+            $vertexes,
+            $keptEdges,
+        );
+
+        // Экземпляр, которого в объединённом куске не осталось, ложится поверх
+        // того, с которым он слился: шаров стало меньше, а из кадра ничего
+        // не пропало.
+        foreach ($this->cutouts[$second]->vertexes as $vertex => $key) {
+            if (($vertexes[$vertex] ?? null) !== $key) {
+                $this->absorbed[$key] = $vertexes[$vertex] ?? $key;
+            }
+        }
+
+        $this->kill($first);
+        $this->kill($second);
+        $this->live[] = $id;
+        $this->acted[] = $id;
+    }
+
+    /**
+     * Связать два шара новой палкой: у куска прибавляется ребро, которого
+     * в графе нет. Дальше по нему и режут, поэтому резать его предстоит
+     * столько раз, в скольких гранях оно лежит.
+     *
+     * @param array{int, int} $tie
+     * @param array<int, int[]> $walks грани, которые должны получиться
+     */
+    private function tie(array $tie, array $walks): void
+    {
+        $id = $this->findByVertexes($tie);
+
+        if ($id === null || isset($this->cutouts[$id]->edges[Scene::edgeName($tie[0], $tie[1])])) {
+            return;
+        }
+
+        $this->touched = [$id];
+        $results = array_map(static fn (array $walk): Piece => Piece::ofWalk($walk), $walks);
+        $edges = [];
+
+        foreach ($this->cutouts[$id]->piece->edges as [$vertexA, $vertexB]) {
+            $edges[Scene::edgeName($vertexA, $vertexB)] = [$vertexA, $vertexB];
+        }
+
+        $piece = Piece::ofEdges(array_merge(array_values($edges), [$tie]));
+        $tied = $this->create(
+            $piece,
+            $id,
+            $this->tables[$id],
+            $this->places[$id],
+            $this->cutouts[$id]->vertexes,
+            $this->cutouts[$id]->edges,
+        );
+
+        $this->kill($id);
+        $this->live[] = $tied;
+        $this->acted[] = $tied;
+        $this->tieNames[Scene::edgeName($tie[0], $tie[1])] = true;
+        $this->ties[$this->cutouts[$tied]->edges[Scene::edgeName($tie[0], $tie[1])]] = true;
+
+        // Сколько раз ещё резать каждое ребро склеенного куска: столько,
+        // в скольких из получившихся граней оно лежит.
+        foreach ($piece->edges as [$vertexA, $vertexB]) {
+            $name = Scene::edgeName($vertexA, $vertexB);
+            $this->cuts[$name] = 0;
+
+            foreach ($results as $result) {
+                foreach ($result->edges as [$oneA, $oneB]) {
+                    if (Scene::edgeName($oneA, $oneB) === $name) {
+                        $this->cuts[$name]++;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Экземпляры, слившиеся с другими при объединении: каждый лежит поверх
+     * того, в который слился, и потому из кадра не пропадает.
+     *
+     * @return array<string, string>
+     */
+    public function getAbsorbed(): array
+    {
+        return $this->absorbed;
+    }
+
+    /**
+     * Связи, добавленные склейкой: их рисуют пунктиром.
+     *
+     * @return array<string, true>
+     */
+    public function getTies(): array
+    {
+        return $this->ties;
+    }
+
+    /**
+     * Живой кусок ровно с такими же рёбрами.
+     */
+    private function findByPiece(Piece $piece): ?int
+    {
+        $names = [];
+
+        foreach ($piece->edges as [$vertexA, $vertexB]) {
+            $names[Scene::edgeName($vertexA, $vertexB)] = true;
+        }
+
+        foreach ($this->live as $id) {
+            if (array_keys($this->cutouts[$id]->edges) === array_keys($names)
+                || (count($this->cutouts[$id]->edges) === count($names)
+                    && array_diff_key($this->cutouts[$id]->edges, $names) === [])
+            ) {
+                return $id;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Раздать места в порядке сборки.
      *
      * Куски не переставляются на глазах: очередь видна сразу, потому что
@@ -308,25 +596,49 @@ final class CutPlan
      * Перестановка уже разложенных кусков — лишнее движение, за которым
      * не уследить.
      *
-     * @param array<int, int> $order вершина => каким по счёту шагом её уложат
+     * Нумеруются места, а не куски: одно и то же место занимает целая цепочка
+     * кусков — ветвь, а потом всё, что от неё остаётся после каждого разреза.
+     * Если раздавать номера кускам, их выйдет больше, чем мест на столе,
+     * и последним ляжет некуда — они окажутся в начале координат поверх чужих
+     * полей. Место достаётся цепочке, а очередь его — по самому раннему в ней.
+     *
+     * Место, с которого в укладку так никто и не уедет, — временное: на нём
+     * ветвь лежала, пока её резали. Такие уходят в конец кольца, чтобы
+     * не разрывать очередь тех, кого и правда будут забирать.
+     *
+     * @param int[] $order куски в том порядке, в каком они лягут в укладку
      */
     public function orderSlots(array $order): void
     {
-        $ranked = [];
+        $queue = array_flip(array_values($order));
+        $ranks = [];
 
         foreach ($this->places as $id => $place) {
-            if ($place !== self::HOME) {
-                $ranked[$this->tables[$id]][] = [$this->getRank($id, $order), $place, $id];
+            if ($place === self::HOME) {
+                continue;
+            }
+
+            $table = $this->tables[$id];
+            $ranks[$table][$place] = min($ranks[$table][$place] ?? PHP_INT_MAX, $queue[$id] ?? PHP_INT_MAX);
+        }
+
+        $moved = [];
+
+        foreach ($ranks as $table => $places) {
+            asort($places);
+            $number = 0;
+
+            foreach (array_keys($places) as $place) {
+                $moved[$table][$place] = $number;
+                $number++;
             }
         }
 
         $places = [];
 
-        foreach ($ranked as $table) {
-            sort($table);
-
-            foreach ($table as $number => [, , $id]) {
-                $places[$id] = $number;
+        foreach ($this->places as $id => $place) {
+            if ($place !== self::HOME) {
+                $places[$id] = $moved[$this->tables[$id]][$place];
             }
         }
 
@@ -412,6 +724,12 @@ final class CutPlan
             $copy = $this->edgeCopies[$name] ?? 0;
             $this->edgeCopies[$name] = $copy + 1;
             $edges[$name] = Scene::edgeKey($vertexA, $vertexB, $copy);
+
+            // У связи копии такие же, как у обычного ребра, и все они связи:
+            // рисуются пунктиром, потому что в графе их нет.
+            if (isset($this->tieNames[$name])) {
+                $this->ties[$edges[$name]] = true;
+            }
         }
 
         $this->cutouts[$id] = new Cutout($piece, $parent, $vertexes, $edges);
@@ -460,40 +778,6 @@ final class CutPlan
         }
 
         return $edges === [] ? new Piece(array_values($vertexes), []) : Piece::ofEdges($edges);
-    }
-
-    /**
-     * Экземпляры родителя, которые достаются этой части: каждый достаётся
-     * только одной, остальные заводят себе новые.
-     *
-     * @param array<int, true> $takenVertexes
-     * @param array<string, true> $takenEdges
-     *
-     * @return array{array<int, string>, array<string, string>}
-     */
-    private function takeKeys(int $parent, Piece $part, array &$takenVertexes, array &$takenEdges): array
-    {
-        $from = $this->cutouts[$parent];
-        $vertexes = [];
-        $edges = [];
-
-        foreach ($part->vertexes as $vertex) {
-            if (isset($from->vertexes[$vertex]) && ! isset($takenVertexes[$vertex])) {
-                $takenVertexes[$vertex] = true;
-                $vertexes[$vertex] = $from->vertexes[$vertex];
-            }
-        }
-
-        foreach ($part->edges as [$vertexA, $vertexB]) {
-            $name = Scene::edgeName($vertexA, $vertexB);
-
-            if (isset($from->edges[$name]) && ! isset($takenEdges[$name])) {
-                $takenEdges[$name] = true;
-                $edges[$name] = $from->edges[$name];
-            }
-        }
-
-        return [$vertexes, $edges];
     }
 
     /**

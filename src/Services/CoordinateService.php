@@ -27,21 +27,19 @@ use EugeneErg\Graphs\ValueObjects\Topology;
  */
 final readonly class CoordinateService
 {
-    /** Сколько кругов чистки делать после того, как силы успокоились. */
-    private const int POLISH_ROUNDS = 60;
+    /** Предохранитель: сколько шагов выравнивания самое большее за один круг. */
+    private const int EVEN_ROUNDS = 5000;
 
-    /** По скольким направлениям вершина пробует отойти. */
-    private const int POLISH_DIRECTIONS = 16;
+    /** Через сколько кругов без заметного улучшения шаг делится пополам. */
+    private const int EVEN_PATIENCE = 5;
 
-    /** Сколько раз укорачивается пробный шаг. */
-    private const int POLISH_DIVISIONS = 4;
+    /** По скольким направлениям вершина пробует шагнуть. */
+    private const int EVEN_DIRECTIONS = 16;
 
     public function __construct(
         private GeometryService $geometry = new GeometryService(),
         private int $maxIterations = 800,
         private float $accuracy = 0.01,
-        private int $maxStepDivisions = 6,
-        private float $cooling = 0.985,
         private MotionService $motion = new MotionService(),
     ) {
     }
@@ -56,10 +54,14 @@ final readonly class CoordinateService
         ?Trace $trace = null,
     ): array {
         $result = $this->getCircle($topology->outerEdge->vertexes, $radius, $center);
+        // Вторая группа — обход, который прокладывает этот шаг: по нему
+        // отрисовка узнаёт, какие рёбра уже легли, а значит и в каком порядке
+        // поля укладывались на самом деле. Внешняя грань — замкнутый обход,
+        // поэтому первая вершина повторяется в конце.
         $trace?->add(
             StageKind::Build,
             sprintf('Кладём внешнюю грань на окружность: %s', implode(' - ', $topology->outerEdge->vertexes)),
-            [array_keys($result)],
+            [array_keys($result), [...$topology->outerEdge->vertexes, ...array_slice($topology->outerEdge->vertexes, 0, 1)]],
         );
 
         foreach ($topology->arcs as $number => $arc) {
@@ -84,7 +86,7 @@ final readonly class CoordinateService
                     $number + 1,
                     implode(' - ', array_merge(...$arc->vertexes)),
                 ),
-                [array_keys($result)],
+                [array_keys($result), array_merge(...$arc->vertexes)],
                 $added,
             );
         }
@@ -124,6 +126,7 @@ final readonly class CoordinateService
     {
         $outerVertexes = array_flip($outerEdge->vertexes);
         $neighbours = array_diff_key($this->getNeighbours($edges), $outerVertexes);
+        $guess = $coordinates;
 
         for ($iteration = 0; $iteration < $this->maxIterations; $iteration++) {
             $shift = .0;
@@ -145,7 +148,16 @@ final readonly class CoordinateService
             }
         }
 
-        return $coordinates;
+        // Татт честен только для трёхсвязного графа. Кусок, который держится
+        // за остальное двумя точками (цепочка, K4 на одной вершине вместе со
+        // связками склейки), он сплющивает в отрезок или в точку, и
+        // расслабление такое уже не разведёт. Тогда остаётся догадка: она
+        // тоже плоская, только кривее.
+        $all = $this->motion->getEdges($this->getNeighbours(array_merge([$outerEdge], $edges)));
+
+        return $this->compareScores($this->getScore($coordinates, $all), $this->getScore($guess, $all)) < 0
+            ? $guess
+            : $coordinates;
     }
 
     /**
@@ -174,206 +186,188 @@ final readonly class CoordinateService
      */
     public function relaxSteps(Edge $outerEdge, array $edges, array $coordinates): array
     {
-        $faces = $this->orientFaces($edges, $coordinates);
-        $flats = $this->getFlats($outerEdge, $faces);
-        $neighbours = $this->getNeighbours($faces);
-        $idealLength = $this->getIdealLength($outerEdge, $coordinates);
-        $temperature = $idealLength;
-        $steps = [$coordinates];
-        $bestStep = 0;
-        $edges = $this->motion->getEdges($this->getNeighbours(array_merge([$outerEdge], $faces)));
-        $bestScore = $this->getScore($coordinates, $edges);
-
-        for ($iteration = 0; $iteration < $this->maxIterations; $iteration++) {
-            $previous = $coordinates;
-            $shift = .0;
-
-            foreach ($flats as $vertex => $flat) {
-                $moved = $this->relaxVertex(
-                    $vertex,
-                    $flat,
-                    $neighbours[$vertex] ?? [],
-                    $coordinates,
-                    $idealLength,
-                    $temperature,
-                );
-
-                if ($moved === null) {
-                    continue;
-                }
-
-                $shift = max($shift, $this->geometry->distance($coordinates[$vertex], $moved));
-                $coordinates[$vertex] = $moved;
-            }
-
-            // Каждая вершина по отдельности шагает законно, но едут они разом,
-            // и по дороге рисунок может пересечься. Укорачиваем шаг всей волны,
-            // пока переход целиком не станет плоским.
-            $ratio = $this->motion->getSafeRatio($previous, $coordinates, $edges, $this->maxStepDivisions);
-
-            if ($ratio < 1.0) {
-                $coordinates = $ratio > 0
-                    ? $this->motion->interpolate($previous, $coordinates, $ratio)
-                    : $previous;
-                $shift *= $ratio;
-            }
-
-            $steps[] = $coordinates;
-            $score = $this->getScore($coordinates, $edges);
-
-            if ($score > $bestScore) {
-                $bestScore = $score;
-                $bestStep = count($steps) - 1;
-            }
-
-            // Пока укладка заметно двигается, температуру держим: в тесных местах
-            // вершины расходятся медленно, и раннее остывание оставляет их слипшимися.
-            if ($shift < $temperature * 0.6) {
-                $temperature *= $this->cooling;
-            }
-
-            if ($shift < $this->accuracy) {
-                break;
-            }
-        }
-
-        // Силовая модель по дороге раскачивается, поэтому дальше идёт не
-        // последнее состояние, а лучшее из встреченных: результат не бывает
-        // хуже начального.
-        $steps = array_slice($steps, 0, $bestStep + 1);
-
-        return $this->polishSteps($steps, $flats, $neighbours, $edges, $idealLength, $bestScore);
+        return $this->evenSteps($outerEdge, $edges, $coordinates);
     }
 
     /**
-     * Чистка: развести вершины с чужих рёбер.
+     * Расслабление выравниванием просветов. Просвет вершины — расстояние до
+     * ближайшей другой вершины и до ближайшего ребра, которое к ней не
+     * приходит. Идеал — когда просветы у всех как можно ровнее и при этом
+     * как можно шире: так средняя вершина ломаной встаёт ровно посередине.
      *
-     * Силы уравнивают длины рёбер, но не видят главного огреха читаемости —
-     * вершины, лежащей на чужом ребре. Расстояние до соседних вершин при этом
-     * может быть каким угодно большим, а выглядит всё равно как пересечение,
-     * которого нет. Поэтому каждая вершина пробует отойти в ту сторону, где
-     * её просвет до чужих рёбер больше, и шаг принимается только если укладка
-     * от него выиграла.
+     * Вершины по очереди пробуют шагнуть в разные стороны; шаг принимается,
+     * если просветы стали ровнее (`compareEven`), а самый узкий не просел.
+     * Считается весь рисунок, а не одна
+     * вершина: вершина, у которой просторно, отойдёт, если этим освободит
+     * место тесным соседям. Шаг — только если рёбра вершины по дороге
+     * ничего не задели, поэтому рисунок остаётся плоским. Когда никто
+     * никуда не шагнул, шаг делится пополам.
      *
-     * @param Point2D[][] $steps
-     * @param array<int, int[]> $flats
-     * @param array<int, int[]> $neighbours
-     * @param array<int, array{int, int}> $edges
+     * @param Edge[] $edges внутренние грани
+     * @param Point2D[] $coordinates
      *
      * @return Point2D[][]
      */
-    private function polishSteps(
-        array $steps,
-        array $flats,
-        array $neighbours,
-        array $edges,
-        float $idealLength,
-        float $bestScore,
-    ): array {
-        $coordinates = $steps[count($steps) - 1];
-        $bestStep = count($steps) - 1;
-        $step = $idealLength / 2;
+    private function evenSteps(Edge $outerEdge, array $edges, array $coordinates): array
+    {
+        $neighbours = $this->getNeighbours($edges);
+        $lines = $this->motion->getEdges($this->getNeighbours(array_merge([$outerEdge], $edges)));
+        $fixed = array_flip($outerEdge->vertexes);
+        $movable = array_values(array_filter(array_keys($neighbours), static fn (int $vertex): bool => ! isset($fixed[$vertex])));
+        $incident = [];
 
-        for ($iteration = 0; $iteration < self::POLISH_ROUNDS; $iteration++) {
-            $previous = $coordinates;
-            $shift = .0;
-            $score = $this->getScore($coordinates, $edges);
+        foreach ($lines as [$vertexA, $vertexB]) {
+            $incident[$vertexA][] = $vertexB;
+            $incident[$vertexB][] = $vertexA;
+        }
 
-            foreach ($flats as $vertex => $flat) {
-                $moved = $this->polishVertex($vertex, $flat, $neighbours[$vertex] ?? [], $coordinates, $step);
+        $steps = [$coordinates];
+        $ideal = $this->getIdealLength($outerEdge, $coordinates);
 
-                if ($moved === null) {
+        // Сначала расширяются самые узкие места, потом, не давая самому
+        // узкому просесть, выравнивается остальное: иначе выравнивание
+        // начиналось бы с тесной догадки и держалось её уровня.
+        // Каждый круг идёт, пока рисунок меняется больше, чем на точность:
+        // шаг мельчает, когда шагов не находится или они почти ничего
+        // не дают, и круг кончается, когда шаг стал меньше точности.
+        // Повторять оба круга друг за другом бессмысленно: они меряют разное
+        // и перетягивают рисунок друг у друга.
+        foreach ([false, true] as $even) {
+            $step = $even ? $ideal / 4 : $ideal / 2;
+            $mark = $this->getScore($coordinates, $lines);
+
+            for ($round = 0; $round < self::EVEN_ROUNDS && $step > $this->accuracy; $round++) {
+                // Шаги ещё находятся, но рисунок почти не лучшеет: вершины
+                // топчутся около своего места. Тогда шаг мельче.
+                if ($round % self::EVEN_PATIENCE === self::EVEN_PATIENCE - 1) {
+                    $score = $this->getScore($coordinates, $lines);
+
+                    if (! $this->hasProgress($score, $mark)) {
+                        $step /= 2;
+                    }
+
+                    $mark = $score;
+                }
+
+                $previous = $coordinates;
+                $moves = [];
+
+                foreach ($movable as $vertex) {
+                    $moved = $this->getEvenMove($vertex, $coordinates, $lines, $incident, $step, $even);
+
+                    if ($moved !== null) {
+                        $coordinates[$vertex] = $moved;
+                        $moves[] = [$vertex, $moved];
+                    }
+                }
+
+                if ($moves === []) {
+                    $step /= 2;
+
                     continue;
                 }
 
-                // Вершине виден только её угол картинки, поэтому её шаг
-                // принимается, лишь если укладке в целом не стало хуже:
-                // разводя одну пару, легко свести другую.
-                $was = $coordinates[$vertex];
-                $coordinates[$vertex] = $moved;
-                $now = $this->getScore($coordinates, $edges);
+                // Вершины шагали по очереди, а картинка проигрывает шаг разом:
+                // если по дороге что-то пересекается, шаг идёт по одной вершине.
+                if (! $this->motion->isTransitionPlanar($previous, $coordinates, $lines)) {
+                    $coordinates = $previous;
 
-                if ($now < $score - GeometryService::EPSILON) {
-                    $coordinates[$vertex] = $was;
+                    foreach ($moves as [$vertex, $moved]) {
+                        $coordinates[$vertex] = $moved;
+                        $steps[] = $coordinates;
+                    }
 
                     continue;
                 }
 
-                $score = max($score, $now);
-                $shift = max($shift, $this->geometry->distance($was, $moved));
-            }
-
-            $ratio = $this->motion->getSafeRatio($previous, $coordinates, $edges, $this->maxStepDivisions);
-
-            if ($ratio < 1.0) {
-                $coordinates = $ratio > 0
-                    ? $this->motion->interpolate($previous, $coordinates, $ratio)
-                    : $previous;
-                $shift *= $ratio;
-            }
-
-            $steps[] = $coordinates;
-            $score = $this->getScore($coordinates, $edges);
-
-            if ($score > $bestScore) {
-                $bestScore = $score;
-                $bestStep = count($steps) - 1;
-            }
-
-            if ($shift < $this->accuracy) {
-                $step /= 2;
-
-                if ($step < $this->accuracy) {
-                    break;
-                }
+                $steps[] = $coordinates;
             }
         }
 
-        return array_slice($steps, 0, $bestStep + 1);
+
+        return $steps;
     }
 
     /**
-     * Куда вершине отойти, чтобы просвет вокруг неё стал больше.
+     * Лучший шаг вершины по просветам всего рисунка, или null.
      *
-     * Перебираются направления вокруг вершины; принимается то, где местный
-     * просвет наибольший, а укладка осталась плоской. Если лучше некуда,
-     * вершина остаётся на месте.
+     * Для каждой другой вершины заранее считается её просвет без участия
+     * этой: пока шагает одна, у остальных меняются только расстояния до неё
+     * и до её рёбер.
      *
-     * @param int[] $flat
-     * @param int[] $neighbours
      * @param Point2D[] $coordinates
+     * @param array<int, array{int, int}> $lines
+     * @param array<int, int[]> $incident
      */
-    private function polishVertex(int $vertex, array $flat, array $neighbours, array $coordinates, float $step): ?Point2D
+    private function getEvenMove(int $vertex, array $coordinates, array $lines, array $incident, float $step, bool $even): ?Point2D
     {
-        $origin = $coordinates[$vertex];
-        $polygon = array_map(static fn (int $item): Point2D => $coordinates[$item], $flat);
-        $visible = $this->geometry->visibilityPolygon($origin, $polygon);
+        $base = [];
 
-        if ($visible === []) {
-            return null;
+        foreach ($coordinates as $other => $point) {
+            if ($other === $vertex) {
+                continue;
+            }
+
+            $clearance = INF;
+
+            foreach ($coordinates as $third => $thirdPoint) {
+                if ($third !== $other && $third !== $vertex) {
+                    $clearance = min($clearance, $this->geometry->distance($point, $thirdPoint));
+                }
+            }
+
+            foreach ($lines as [$vertexA, $vertexB]) {
+                if ($vertexA !== $other && $vertexB !== $other && $vertexA !== $vertex && $vertexB !== $vertex) {
+                    $clearance = min($clearance, $this->geometry->distanceToSegment($point, $coordinates[$vertexA], $coordinates[$vertexB]));
+                }
+            }
+
+            $base[$other] = $clearance;
         }
 
-        $neighbourPoints = array_map(static fn (int $item): Point2D => $coordinates[$item], $neighbours);
-        $best = $this->getLocalScore($origin, $neighbourPoints, $polygon);
-        $result = null;
+        $own = $incident[$vertex] ?? [];
+        $clearances = function (Point2D $at) use ($vertex, $coordinates, $lines, $own, $base): array {
+            $result = [];
+            $mine = INF;
 
-        for ($direction = 0; $direction < self::POLISH_DIRECTIONS; $direction++) {
-            $angle = 2 * M_PI * $direction / self::POLISH_DIRECTIONS;
+            foreach ($base as $other => $clearance) {
+                $point = $coordinates[$other];
+                $distance = $this->geometry->distance($point, $at);
+                $mine = min($mine, $distance);
+                $clearance = min($clearance, $distance);
 
-            for ($division = 0; $division < self::POLISH_DIVISIONS; $division++) {
-                $length = $step / (2 ** $division);
-                $candidate = new Point2D($origin->x + cos($angle) * $length, $origin->y + sin($angle) * $length);
-                $score = $this->getLocalScore($candidate, $neighbourPoints, $polygon);
-
-                if ($score <= $best
-                    || ! $this->geometry->isPointInPolygon($candidate, $visible)
-                    || ! $this->isPlanarPosition($candidate, $polygon, $neighbourPoints)
-                ) {
-                    continue;
+                foreach ($own as $neighbour) {
+                    if ($neighbour !== $other) {
+                        $clearance = min($clearance, $this->geometry->distanceToSegment($point, $at, $coordinates[$neighbour]));
+                    }
                 }
 
-                $best = $score;
-                $result = $candidate;
+                $result[] = $clearance;
+            }
+
+            foreach ($lines as [$vertexA, $vertexB]) {
+                if ($vertexA !== $vertex && $vertexB !== $vertex) {
+                    $mine = min($mine, $this->geometry->distanceToSegment($at, $coordinates[$vertexA], $coordinates[$vertexB]));
+                }
+            }
+
+            $result[] = $mine;
+            sort($result);
+
+            return $result;
+        };
+
+        $origin = $coordinates[$vertex];
+        $best = $clearances($origin);
+        $result = null;
+
+        for ($direction = 0; $direction < self::EVEN_DIRECTIONS; $direction++) {
+            $angle = 2 * M_PI * $direction / self::EVEN_DIRECTIONS;
+            $candidate = new Point2D($origin->x + cos($angle) * $step, $origin->y + sin($angle) * $step);
+            $score = $clearances($candidate);
+
+            if (($even ? $this->compareEven($score, $best) : $this->compareLeximin($score, $best)) > 0 && $this->isFreeMove($vertex, $candidate, $own, $coordinates, $lines)) {
+                [$best, $result] = [$score, $candidate];
             }
         }
 
@@ -381,226 +375,156 @@ final readonly class CoordinateService
     }
 
     /**
-     * Просвет вокруг вершины: насколько она далека от стен своей комнаты
-     * и насколько её собственные рёбра далеки от чужих углов.
+     * Стал ли рисунок заметно лучше: самый узкий просвет шире или просветы
+     * в целом шире.
      *
-     * @param Point2D[] $neighbours
-     * @param Point2D[] $polygon
+     * @param float[] $now просветы по возрастанию
+     * @param float[] $before
      */
-    private function getLocalScore(Point2D $point, array $neighbours, array $polygon): float
+    private function hasProgress(array $now, array $before): bool
     {
-        $count = count($polygon);
-        $result = INF;
+        $sum = static fn (array $clearances): float => array_sum(array_map(
+            static fn (float $clearance): float => log(max($clearance, 1e-9)),
+            $clearances,
+        ));
 
-        for ($i = 0; $i < $count; $i++) {
-            $result = min($result, $this->geometry->distanceToSegment($point, $polygon[$i], $polygon[($i + 1) % $count]));
-        }
-
-        foreach ($neighbours as $end) {
-            foreach ($polygon as $corner) {
-                if ($this->geometry->distance($corner, $end) > GeometryService::EPSILON) {
-                    $result = min($result, $this->geometry->distanceToSegment($corner, $point, $end));
-                }
-            }
-        }
-
-        return $result === INF ? .0 : $result;
+        return ($now[0] ?? .0) > ($before[0] ?? .0) + 10 * $this->accuracy
+            || $sum($now) > $sum($before) + 1e-2;
     }
 
     /**
-     * Отталкивание от стен своей комнаты.
+     * Просветы по возрастанию: чей первый заметно отличающийся шире, та
+     * укладка и лучше.
      *
-     * Соседние вершины могут разъехаться как угодно далеко, а вершина всё
-     * равно будет лежать на чужом ребре: расстояние до вершин и расстояние
-     * до рёбер — разные вещи. Стены комнаты — это и есть ближайшие чужие
-     * рёбра, дальше них вершина всё равно не уходит, поэтому достаточно
-     * отталкиваться от них.
-     *
-     * @param Point2D[] $polygon
-     *
-     * @return array{float, float}
+     * @param float[] $a
+     * @param float[] $b
      */
-    private function getWallForce(
-        Point2D $origin,
-        array $polygon,
-        float $idealLength,
-    ): array {
-        $count = count($polygon);
-        $x = .0;
-        $y = .0;
+    private function compareLeximin(array $a, array $b): int
+    {
+        foreach ($a as $number => $value) {
+            $other = $b[$number] ?? .0;
 
-        for ($i = 0; $i < $count; $i++) {
-            $from = $polygon[$i];
-            $to = $polygon[($i + 1) % $count];
+            if (abs($value - $other) > $this->accuracy / 10) {
+                return $value <=> $other;
+            }
+        }
 
-            // Стены комнаты — это рёбра, не приходящие в саму вершину: она
-            // внутри. Если вдруг стена всё же в неё упирается, отталкиваться
-            // от такой стены нельзя — своё ребро должно оставаться коротким.
-            if ($this->geometry->distance($origin, $from) < GeometryService::EPSILON
-                || $this->geometry->distance($origin, $to) < GeometryService::EPSILON
+        return 0;
+    }
+
+    /**
+     * Какая укладка ровнее. Самый узкий просвет проседать не должен; при
+     * этом условии лучше та, где просветы в целом ровнее и шире — по сумме
+     * логарифмов: тесная вершина весит больше просторной, но и просторная
+     * может уступить немного из своего запаса, если тесной от этого
+     * заметно легче.
+     *
+     * @param float[] $a просветы по возрастанию
+     * @param float[] $b
+     */
+    private function compareEven(array $a, array $b): int
+    {
+        if (($a[0] ?? .0) < ($b[0] ?? .0) - $this->accuracy / 10) {
+            return -1;
+        }
+
+        $sum = static fn (array $clearances): float => array_sum(array_map(
+            static fn (float $clearance): float => log(max($clearance, 1e-9)),
+            $clearances,
+        ));
+        $difference = $sum($a) - $sum($b);
+
+        return abs($difference) < 1e-4 ? 0 : ($difference > 0 ? 1 : -1);
+    }
+
+    /**
+     * Проедет ли вершина по прямой, не задев рёбрами ничего чужого. Сама
+     * вершина через ребро пройти не может, не задев его своими рёбрами.
+     *
+     * @param int[] $neighbours
+     * @param Point2D[] $coordinates
+     * @param array<int, array{int, int}> $edges
+     */
+    private function isFreeMove(int $vertex, Point2D $target, array $neighbours, array $coordinates, array $edges): bool
+    {
+        $origin = $coordinates[$vertex];
+
+        // Сама вершина не переходит через чужое ребро — даже через ребро,
+        // которое сходится с её собственным в соседе: иначе у соседа
+        // меняется порядок рёбер, а с ним и грани.
+        foreach ($edges as [$vertexA, $vertexB]) {
+            if ($vertexA !== $vertex && $vertexB !== $vertex
+                && $this->geometry->segmentsIntersect($origin, $target, $coordinates[$vertexA], $coordinates[$vertexB])
             ) {
-                continue;
+                return false;
             }
-
-            $closest = $this->geometry->closestOnSegment($origin, $from, $to);
-            $distance = $this->geometry->distance($origin, $closest);
-
-            if ($distance < GeometryService::EPSILON || $distance > $idealLength) {
-                continue;
-            }
-
-            $force = $idealLength ** 2 / $distance ** 2;
-            $x += ($origin->x - $closest->x) / $distance * $force;
-            $y += ($origin->y - $closest->y) / $distance * $force;
-        }
-
-        return [$x, $y];
-    }
-
-    /**
-     * Новое положение вершины или null, если сдвинуться некуда.
-     *
-     * Силы задают направление, многоугольник видимости — предел: дальше стены
-     * вершина не уходит. Если и укороченный шаг ломает планарность, он делится
-     * пополам, пока не станет допустимым.
-     *
-     * @param int[] $flat многоугольник из смежных граней
-     * @param int[] $neighbours
-     * @param Point2D[] $coordinates
-     */
-    private function relaxVertex(
-        int $vertex,
-        array $flat,
-        array $neighbours,
-        array $coordinates,
-        float $idealLength,
-        float $temperature,
-    ): ?Point2D {
-        $origin = $coordinates[$vertex];
-        $polygon = array_map(static fn (int $item): Point2D => $coordinates[$item], $flat);
-        $visible = $this->geometry->visibilityPolygon($origin, $polygon);
-
-        if ($visible === []) {
-            return null;
-        }
-
-        $target = $this->geometry->clipToPolygon(
-            $origin,
-            $this->getForceTarget($vertex, $neighbours, $coordinates, $polygon, $idealLength, $temperature),
-            $visible,
-        );
-        $neighbourPoints = array_map(static fn (int $item): Point2D => $coordinates[$item], $neighbours);
-
-        for ($division = 0; $division <= $this->maxStepDivisions; $division++) {
-            $ratio = 1 / (2 ** $division);
-            $candidate = new Point2D(
-                $origin->x + ($target->x - $origin->x) * $ratio,
-                $origin->y + ($target->y - $origin->y) * $ratio,
-            );
-
-            if ($this->geometry->distance($origin, $candidate) < $this->accuracy) {
-                return null;
-            }
-
-            if ($this->isPlanarPosition($candidate, $polygon, $neighbourPoints)) {
-                return $candidate;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Куда вершину тянут силы: рёбра притягивают к идеальной длине,
-     * остальные вершины отталкивают. Температура ограничивает длину шага
-     * и остывает от итерации к итерации, чтобы укладка сходилась.
-     *
-     * @param int[] $neighbours
-     * @param Point2D[] $coordinates
-     * @param Point2D[] $polygon стены комнаты, в которой живёт вершина
-     */
-    private function getForceTarget(
-        int $vertex,
-        array $neighbours,
-        array $coordinates,
-        array $polygon,
-        float $idealLength,
-        float $temperature,
-    ): Point2D {
-        $origin = $coordinates[$vertex];
-        [$x, $y] = $this->getWallForce($origin, $polygon, $idealLength);
-
-        foreach ($coordinates as $other => $point) {
-            if ($other === $vertex) {
-                continue;
-            }
-
-            $distance = $this->geometry->distance($origin, $point);
-
-            if ($distance < GeometryService::EPSILON) {
-                continue;
-            }
-
-            $force = $idealLength ** 2 / $distance ** 2;
-            $x += ($origin->x - $point->x) / $distance * $force;
-            $y += ($origin->y - $point->y) / $distance * $force;
         }
 
         foreach ($neighbours as $neighbour) {
             $point = $coordinates[$neighbour];
-            $distance = $this->geometry->distance($origin, $point);
 
-            if ($distance < GeometryService::EPSILON) {
-                continue;
+            foreach ($edges as [$vertexA, $vertexB]) {
+                if ($vertexA === $vertex || $vertexB === $vertex || $vertexA === $neighbour || $vertexB === $neighbour) {
+                    continue;
+                }
+
+                $a = $coordinates[$vertexA];
+                $b = $coordinates[$vertexB];
+
+                if ($this->geometry->segmentsIntersectDuringMotion($origin, $target, $point, $point, $a, $a, $b, $b)) {
+                    return false;
+                }
             }
-
-            $force = $distance ** 2 / $idealLength;
-            $x += ($point->x - $origin->x) / $distance * $force;
-            $y += ($point->y - $origin->y) / $distance * $force;
         }
 
-        $length = sqrt($x ** 2 + $y ** 2);
-
-        if ($length > $temperature) {
-            $x *= $temperature / $length;
-            $y *= $temperature / $length;
-        }
-
-        return new Point2D($origin->x + $x, $origin->y + $y);
+        return true;
     }
 
     /**
-     * Насколько укладка читаема: чем дальше ближайшие вершины друг от друга
-     * и от чужих рёбер, тем меньше нужно приближать картинку.
+     * Насколько укладка читаема: у каждой вершины — просвет, расстояние до
+     * ближайшей другой вершины и до ближайшего чужого ребра; просветы по
+     * возрастанию. Чем они больше, тем меньше нужно приближать картинку.
      *
      * Одного расстояния между вершинами мало: вершина может стоять далеко
      * от всех вершин и при этом лежать на чужом ребре — и выглядит это как
      * пересечение, которого нет.
      *
+     * И одного самого узкого просвета мало: если в укладке слиплись две пары,
+     * то, разведя одну, узкий просвет остаётся тем же — и шаг, который
+     * улучшил картинку, выбрасывается как ничего не давший. Поэтому
+     * укладки сравниваются по всем просветам сразу (`compareScores`).
+     *
      * @param Point2D[] $coordinates
      * @param array<int, array{int, int}> $edges
+     *
+     * @return float[]
      */
-    private function getScore(array $coordinates, array $edges): float
+    private function getScore(array $coordinates, array $edges): array
     {
-        $points = array_values($coordinates);
-        $count = count($points);
-        $result = INF;
+        $clearances = array_fill_keys(array_keys($coordinates), INF);
+        $vertexes = array_keys($coordinates);
+        $count = count($vertexes);
 
         for ($i = 0; $i < $count; $i++) {
             for ($j = $i + 1; $j < $count; $j++) {
-                $result = min($result, $this->geometry->distance($points[$i], $points[$j]));
+                $distance = $this->geometry->distance($coordinates[$vertexes[$i]], $coordinates[$vertexes[$j]]);
+                $clearances[$vertexes[$i]] = min($clearances[$vertexes[$i]], $distance);
+                $clearances[$vertexes[$j]] = min($clearances[$vertexes[$j]], $distance);
             }
         }
 
         foreach ($coordinates as $vertex => $point) {
             foreach ($edges as [$vertexA, $vertexB]) {
                 if ($vertex !== $vertexA && $vertex !== $vertexB) {
-                    $result = min($result, $this->geometry->distanceToSegment($point, $coordinates[$vertexA], $coordinates[$vertexB]));
+                    $clearances[$vertex] = min($clearances[$vertex], $this->geometry->distanceToSegment($point, $coordinates[$vertexA], $coordinates[$vertexB]));
                 }
             }
         }
 
-        return $result === INF ? .0 : $result;
+        $result = array_values(array_map(static fn (float $clearance): float => $clearance === INF ? .0 : $clearance, $clearances));
+        sort($result);
+
+        return $result;
     }
 
     /**
@@ -615,92 +539,6 @@ final readonly class CoordinateService
         $count = max(count($coordinates), 1);
 
         return $area > 0 ? sqrt($area / $count) : 1.0;
-    }
-
-    /**
-     * Сторож планарности: вершина должна остаться строго внутри своего
-     * многоугольника, а её рёбра — не пересечь его границу. Выйти за пределы
-     * этого многоугольника ребро может только пересекая границу, поэтому
-     * локальной проверки достаточно: остальной рисунок вершина не задевает.
-     *
-     * @param Point2D[] $polygon
-     * @param Point2D[] $neighbours
-     */
-    private function isPlanarPosition(Point2D $candidate, array $polygon, array $neighbours): bool
-    {
-        if (! $this->geometry->isPointInPolygon($candidate, $polygon)) {
-            return false;
-        }
-
-        $count = count($polygon);
-
-        foreach ($neighbours as $neighbour) {
-            for ($i = 0; $i < $count; $i++) {
-                if ($this->geometry->segmentsIntersect($candidate, $neighbour, $polygon[$i], $polygon[($i + 1) % $count])) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    /**
-     * Приводит все грани к единому обходу против часовой стрелки:
-     * склейка граней в многоугольник работает только на согласованных обходах.
-     *
-     * @param Edge[] $edges
-     * @param Point2D[] $coordinates
-     *
-     * @return Edge[]
-     */
-    private function orientFaces(array $edges, array $coordinates): array
-    {
-        $result = [];
-
-        foreach ($edges as $edge) {
-            $polygon = array_map(static fn (int $vertex): Point2D => $coordinates[$vertex], $edge->vertexes);
-            $result[] = $this->geometry->doubleArea($polygon) < 0
-                ? new Edge(array_reverse($edge->vertexes))
-                : $edge;
-        }
-
-        return $result;
-    }
-
-    /**
-     * Многоугольник вокруг каждой внутренней вершины: объединение смежных граней
-     * без самой вершины. Вершины внешней грани закреплены и не расслабляются.
-     *
-     * @param Edge[] $faces
-     *
-     * @return int[][] вершина => обход её многоугольника
-     */
-    private function getFlats(Edge $outerEdge, array $faces): array
-    {
-        $outerVertexes = array_flip($outerEdge->vertexes);
-        /** @var Edge[][] $rooms */
-        $rooms = [];
-
-        foreach ($faces as $face) {
-            foreach ($face->vertexes as $vertex) {
-                if (! isset($outerVertexes[$vertex])) {
-                    $rooms[$vertex][] = $face;
-                }
-            }
-        }
-
-        $result = [];
-
-        foreach ($rooms as $vertex => $room) {
-            $flat = $this->mergeRooms($room, $vertex);
-
-            if ($flat !== null) {
-                $result[$vertex] = $flat;
-            }
-        }
-
-        return $result;
     }
 
     /**
@@ -730,61 +568,6 @@ final readonly class CoordinateService
         }
 
         return $result;
-    }
-
-    /**
-     * Обходит грани вокруг вершины по кругу и склеивает их в один многоугольник.
-     *
-     * Из каждой грани берётся кусок от следующей за вершиной точки и до
-     * предыдущей, не включая её: предыдущая точка — это стык со следующей гранью,
-     * она войдёт в обход как её начало.
-     *
-     * @param Edge[] $edges
-     *
-     * @return int[]|null null, если грани вокруг вершины не образуют простого многоугольника
-     */
-    private function mergeRooms(array $edges, int $vertex): array|null
-    {
-        $edges = array_values($edges);
-        $positions = [];
-        $lines = [];
-
-        foreach ($edges as $num => $edge) {
-            $position = array_search($vertex, $edge->vertexes, true);
-
-            if (! is_int($position) || count($edge->vertexes) < 3) {
-                return null;
-            }
-
-            $previous = $edge->getVertex($position - 1);
-            $next = $edge->getVertex($position + 1);
-            $lines[$next] = $num;
-            $positions[$num] = ['pos' => $position, 'vertex' => $previous];
-        }
-
-        $result = [];
-        $edgeCount = count($edges);
-        $current = 0;
-
-        for ($i = 0; $i < $edgeCount; $i++) {
-            ['pos' => $position, 'vertex' => $previous] = $positions[$current];
-            $edge = $edges[$current];
-            $result[] = $edge->getVertexes($position + 1, count($edge->vertexes) - 2);
-
-            if (! isset($lines[$previous])) {
-                return null;
-            }
-
-            $current = $lines[$previous];
-        }
-
-        if ($current !== 0) {
-            return null;
-        }
-
-        $flat = array_merge(...$result);
-
-        return count($flat) < 3 || count(array_unique($flat)) !== count($flat) ? null : $flat;
     }
 
     /**

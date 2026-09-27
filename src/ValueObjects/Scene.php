@@ -30,6 +30,15 @@ final readonly class Scene
      * @param float $weight сколько времени держится кадр
      * @param ?StageKind $kind какой шаг алгоритма показывает кадр; на картинку
      *                         не попадает — по ней шаг и так виден
+     * @param array<string, array{string, int}> $flows ребро => с какого конца
+     *                и каким цветом по нему в этот кадр переползает краска;
+     *                видно, какая точка какую закрасила
+     * @param array<string, true> $ties рёбра, которых в графе нет: их добавила
+     *                склейка, чтобы односвязный граф стал двусвязным. Рисуются
+     *                пунктиром — видно, что это не связь исходного графа
+     * @param array<string, true> $blocked запертые шары: краска через них
+     *                не пройдёт. Этим приёмом алгоритм и находит всё — куски,
+     *                ветви, поля, — поэтому запертое видно сразу и издалека
      */
     public function __construct(
         public array $vertexes,
@@ -39,6 +48,9 @@ final readonly class Scene
         public array $faded = [],
         public float $weight = 1.0,
         public ?StageKind $kind = null,
+        public array $flows = [],
+        public array $ties = [],
+        public array $blocked = [],
     ) {
     }
 

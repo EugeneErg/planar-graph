@@ -324,6 +324,28 @@ abstract class AbstractTestCase extends TestCase
         return self::shiftVertexes($shift, require __DIR__.'/Cases/Graphs/Big2.php');
     }
 
+    /**
+     * Семь несвязных кусков, в каждом семь двусвязных: цепочка из семи
+     * треугольников на общих вершинах сочленения.
+     *
+     * @return true[][]
+     */
+    protected static function getSevenBySeven(int $shift = 0): array
+    {
+        return self::shiftVertexes($shift, require __DIR__.'/Cases/Graphs/SevenBySeven.php');
+    }
+
+    /**
+     * Три несвязных куска, в каждом три двусвязных, и каждый двусвязный —
+     * колесо с семью спицами, то есть семь полей внутри и обод снаружи.
+     *
+     * @return true[][]
+     */
+    protected static function getSevenFields(int $shift = 0): array
+    {
+        return self::shiftVertexes($shift, require __DIR__.'/Cases/Graphs/SevenFields.php');
+    }
+
     protected static function getSmallTree(int $shift = 0): array
     {
         return self::shiftVertexes($shift, require __DIR__.'/Cases/Graphs/SmallTree.php');

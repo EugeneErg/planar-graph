@@ -101,6 +101,7 @@ final readonly class ArcService
                             }
 
                             $this->embedded($trouble, $edge, $replacement);
+                            $this->tracePostpone($trace, $edge, $trouble);
 
                             continue;
                         }
@@ -118,12 +119,23 @@ final readonly class ArcService
                                 }
                             }
 
+                            $before = count($arcs);
                             $graphs = array_merge($graphs, $this->applySolution(
                                 $decisions[SolutionType::Absorption->value],
                                 $replacement->vertexes,
                                 $arcs,
                                 $graph
                             ));
+                            $this->traceArcs(
+                                $trace,
+                                StageKind::Absorb,
+                                [$edge, ...array_merge(...array_map(
+                                    static fn (Solution $solution): array => $solution->trouble->edges,
+                                    $decisions[SolutionType::Absorption->value],
+                                ))],
+                                $before,
+                                $arcs,
+                            );
 
                             continue;
                         }
@@ -145,6 +157,7 @@ final readonly class ArcService
                         }
 
                         $this->embedded($troubles[$fromVertex][$toVertex], $edge, $replacement);
+                        $this->tracePostpone($trace, $edge, $troubles[$fromVertex][$toVertex]);
 
                         for ($i = 1; $i < count($replacement->vertexes) - 1; $i++) {
                             $troubleVertexes[$replacement->vertexes[$i]] = $troubles[$fromVertex][$toVertex];
@@ -156,6 +169,7 @@ final readonly class ArcService
                             new GravityVertexes(...array_slice($replaced, count($replaced) >> 1, 1)),
                             [$replacement->vertexes],
                         );
+                        $this->traceArcs($trace, StageKind::Arc, [$edge], count($arcs) - 1, $arcs);
                     }
                 }
 
@@ -189,11 +203,19 @@ final readonly class ArcService
                             }
                         }
 
+                        $before = count($arcs);
                         $graphs = array_merge($graphs, $this->solutionTroubles(
                             $decisions,
                             $arcs,
                             $mainGravityVertexes
                         ));
+                        $this->traceArcs(
+                            $trace,
+                            StageKind::Merge,
+                            array_merge(...array_map(static fn (Trouble $trouble): array => $trouble->edges, array_values($decisions))),
+                            $before,
+                            $arcs,
+                        );
                     } elseif (count($nextEdges) > 2) {
                         throw new LogicException();
                     }
@@ -209,6 +231,45 @@ final readonly class ArcService
         );
 
         return $arcs;
+    }
+
+    /**
+     * Журнал: поле отложено над ребром границы. Логики не меняет.
+     */
+    private function tracePostpone(?Trace $trace, Edge $face, Trouble $trouble): void
+    {
+        $trace?->add(
+            StageKind::Postpone,
+            sprintf('Откладываем поле %s над ребром %d-%d', implode(' - ', $face->vertexes), $trouble->fromVertex, $trouble->toVertex),
+            [$face->vertexes],
+            [$trouble->fromVertex, $trouble->toVertex],
+        );
+    }
+
+    /**
+     * Журнал: какие поля легли какими дугами. Логики не меняет.
+     *
+     * @param Edge[] $faces
+     * @param Arc[] $arcs
+     */
+    private function traceArcs(?Trace $trace, StageKind $kind, array $faces, int $from, array $arcs): void
+    {
+        if ($trace === null) {
+            return;
+        }
+
+        $numbers = range($from, count($arcs) - 1);
+        $trace->add(
+            $kind,
+            sprintf('Дуги %s: %s', implode(', ', $numbers), implode(' + ', array_map(
+                static fn (Edge $face): string => implode(' - ', $face->vertexes),
+                $faces,
+            ))),
+            array_map(static fn (Edge $face): array => $face->vertexes, $faces),
+            $numbers,
+            [],
+            array_map(static fn (int $number): array => array_merge(...$arcs[$number]->vertexes), $numbers),
+        );
     }
 
     private function getReplacement(Edge $edgeA, Edge $edgeB): ?Replacement
@@ -574,7 +635,7 @@ final readonly class ArcService
             //var_dump('p2', array_filter($arc, fn (array $subArc) => $subArc !== []));die;
             $arcs[] = new Arc(
                 new GravityVertexes(...$mainGravityVertexes),
-                array_filter($arc, fn (array $subArc) => $subArc !== []),
+                array_values(array_filter($arc, fn (array $subArc) => $subArc !== [])),
             );
         }
 
