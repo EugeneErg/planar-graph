@@ -107,15 +107,17 @@ final readonly class SvgService
 
         $keyTimes = $this->getRoundedTimes($this->getKeyTimes($scenes));
         $body = '';
+        $hiddenEdges = $this->getCovered($scenes, true);
+        $hiddenVertexes = $this->getCovered($scenes, false);
 
         foreach ($this->getEdgeKeys($scenes) as $key) {
-            $body .= $this->renderEdge($key, $scenes, $keyTimes, $duration, $repeat);
+            $body .= $this->renderEdge($key, $scenes, $keyTimes, $duration, $repeat, $hiddenEdges[$key] ?? []);
         }
 
         $body .= $this->renderFlows($scenes, $keyTimes, $duration);
 
         foreach ($this->getVertexKeys($scenes) as $key) {
-            $body .= $this->renderVertex($key, $scenes, $keyTimes, $duration, $repeat);
+            $body .= $this->renderVertex($key, $scenes, $keyTimes, $duration, $repeat, $hiddenVertexes[$key] ?? []);
         }
 
         return $this->renderDocument($this->getViewBox($scenes), $this->renderCamera($scenes, $keyTimes, $duration, $repeat) . $body);
@@ -136,7 +138,7 @@ final readonly class SvgService
     private function renderCamera(array $scenes, array $keyTimes, float $duration, bool $repeat): string
     {
         $boxes = array_map(
-            fn (Scene $scene): string => implode(' ', array_map(self::number(...), $this->getViewBox([$scene]))),
+            fn (Scene $scene): string => implode(' ', array_map(self::coord(...), $this->getViewBox([$scene]))),
             $scenes,
         );
 
@@ -297,8 +299,9 @@ final readonly class SvgService
     /**
      * @param Scene[] $scenes
      * @param float[] $keyTimes
+     * @param array<int, true> $hidden кадры, где экземпляр скрыт под другим
      */
-    private function renderEdge(string $key, array $scenes, array $keyTimes, float $duration, bool $repeat): string
+    private function renderEdge(string $key, array $scenes, array $keyTimes, float $duration, bool $repeat, array $hidden = []): string
     {
         $points = [];
         $shown = [];
@@ -326,7 +329,7 @@ final readonly class SvgService
             return '';
         }
 
-        $shown = $this->fadeWhileMoving($shown);
+        [$shown, $points] = $this->applyCovered($this->fadeWhileMoving($shown), $points, $hidden);
         $animations = '';
 
         // Ребро — путь из одного отрезка: оба конца едут одной анимацией,
@@ -334,10 +337,10 @@ final readonly class SvgService
         // моментов и сглаживаний.
         $line = static fn (array $item): string => sprintf(
             'M%s %sL%s %s',
-            self::number($item[0]->x),
-            self::number($item[0]->y),
-            self::number($item[1]->x),
-            self::number($item[1]->y),
+            self::coord($item[0]->x),
+            self::coord($item[0]->y),
+            self::coord($item[1]->x),
+            self::coord($item[1]->y),
         );
         $animations = $this->renderAnimate(
             'd',
@@ -436,24 +439,23 @@ final readonly class SvgService
             return '';
         }
 
+        // Длина линии принята за единицу (pathLength): пунктир и его сдвиг
+        // пишутся одной цифрой, а не длиной ребра в пикселях.
         return sprintf(
             '<line class="edge g%d flow" x1="%s" y1="%s" x2="%s" y2="%s" opacity="0"'
-            . ' stroke-dasharray="%s" stroke-dashoffset="%s">'
+            . ' pathLength="1" stroke-dasharray="1" stroke-dashoffset="1">'
             . '<set attributeName="opacity" to="1" begin="%ss" fill="freeze"/>'
-            . '<animate attributeName="stroke-dashoffset" begin="%ss" dur="%ss" values="%s;0" fill="freeze"/>'
+            . '<animate attributeName="stroke-dashoffset" begin="%ss" dur="%ss" values="1;0" fill="freeze"/>'
             . '<set attributeName="opacity" to="0" begin="%ss" fill="freeze"/>'
             . '</line>',
             $group % count(self::PALETTE),
-            self::number($head->x),
-            self::number($head->y),
-            self::number($tail->x),
-            self::number($tail->y),
-            self::number($length),
-            self::number($length),
+            self::coord($head->x),
+            self::coord($head->y),
+            self::coord($tail->x),
+            self::coord($tail->y),
             self::number($from),
             self::number($from),
             self::number($to - $from),
-            self::number($length),
             self::number($to),
         );
     }
@@ -461,8 +463,9 @@ final readonly class SvgService
     /**
      * @param Scene[] $scenes
      * @param float[] $keyTimes
+     * @param array<int, true> $hidden кадры, где экземпляр скрыт под другим
      */
-    private function renderVertex(string $key, array $scenes, array $keyTimes, float $duration, bool $repeat): string
+    private function renderVertex(string $key, array $scenes, array $keyTimes, float $duration, bool $repeat, array $hidden = []): string
     {
         $points = [];
         $shown = [];
@@ -492,9 +495,9 @@ final readonly class SvgService
             return '';
         }
 
-        $shown = $this->fadeWhileMoving($shown);
+        [$shown, $points] = $this->applyCovered($this->fadeWhileMoving($shown), $points, $hidden);
         $positions = array_map(
-            static fn (?Point2D $item): string => self::number(($item ?? $first)->x) . ',' . self::number(($item ?? $first)->y),
+            static fn (?Point2D $item): string => self::coord(($item ?? $first)->x) . ',' . self::coord(($item ?? $first)->y),
             $points,
         );
         $radius = self::number($this->vertexRadius);
@@ -524,6 +527,150 @@ final readonly class SvgService
             $this->renderAnimate('opacity', $locks, $keyTimes, $duration, $repeat, discrete: true),
             Scene::vertexOf($key),
         );
+    }
+
+    /**
+     * Когда копия лежит ровно на другом экземпляре той же вершины (или того
+     * же ребра) и выглядит так же, её не видно: до разреза копии лежат
+     * поверх оригинала, после сборки снова сходятся. Хранить её путь на это
+     * время незачем — она скрыта, а видимый экземпляр рисует то же самое.
+     *
+     * Скрыта она в кадре, если совпадает с видимым соседом и в этом кадре,
+     * и в следующем: переход между ними тогда тоже один на двоих.
+     *
+     * @param Scene[] $scenes
+     *
+     * @return array<string, array<int, true>> экземпляр => кадры, где он скрыт
+     */
+    private function getCovered(array $scenes, bool $edges): array
+    {
+        $groups = [];
+
+        foreach ($edges ? $this->getEdgeKeys($scenes) : $this->getVertexKeys($scenes) as $key) {
+            [$name, $copy] = explode(':', $key) + [1 => '0'];
+            $groups[$name][(int) $copy] = $key;
+        }
+
+        $result = [];
+        $count = count($scenes);
+
+        foreach ($groups as $keys) {
+            if (count($keys) < 2) {
+                continue;
+            }
+
+            ksort($keys);
+            $keys = array_values($keys);
+
+            for ($number = 0; $number < $count; $number++) {
+                $next = min($number + 1, $count - 1);
+                $shown = [];
+
+                foreach ($keys as $key) {
+                    $covered = false;
+
+                    foreach ($shown as $leader) {
+                        if ($this->isSame($scenes[$number], $key, $leader, $edges)
+                            && $this->isSame($scenes[$next], $key, $leader, $edges)
+                        ) {
+                            $covered = true;
+
+                            break;
+                        }
+                    }
+
+                    if ($covered) {
+                        $result[$key][$number] = true;
+                    } else {
+                        $shown[] = $key;
+                    }
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Лежат ли два экземпляра в кадре в одном месте и выглядят ли одинаково.
+     */
+    private function isSame(Scene $scene, string $key, string $other, bool $edges): bool
+    {
+        $same = static fn (Point2D $a, Point2D $b): bool => abs($a->x - $b->x) < 1e-6 && abs($a->y - $b->y) < 1e-6;
+
+        if ($edges) {
+            $a = $scene->edges[$key] ?? null;
+            $b = $scene->edges[$other] ?? null;
+
+            if ($a === null || $b === null || ! $same($a[0], $b[0]) || ! $same($a[1], $b[1])) {
+                return false;
+            }
+
+            return isset($scene->ties[$key]) === isset($scene->ties[$other]);
+        } else {
+            $a = $scene->vertexes[$key] ?? null;
+            $b = $scene->vertexes[$other] ?? null;
+
+            if ($a === null || $b === null || ! $same($a, $b)) {
+                return false;
+            }
+
+            if (isset($scene->blocked[$key]) !== isset($scene->blocked[$other])) {
+                return false;
+            }
+        }
+
+        return ($scene->groups[$key] ?? null) === ($scene->groups[$other] ?? null)
+            && isset($scene->highlight[$key]) === isset($scene->highlight[$other])
+            && isset($scene->faded[$key]) === isset($scene->faded[$other]);
+    }
+
+    /**
+     * Скрытые кадры: не видно и путь не нужен. Первый кадр скрытого отрезка
+     * держит настоящее место — в него экземпляр приезжает видимым; дальше
+     * он стоит там, где снова покажется, чтобы из записи ушли лишние точки.
+     *
+     * @template T
+     *
+     * @param string[] $shown
+     * @param array<int, T> $points
+     * @param array<int, true> $hidden
+     *
+     * @return array{string[], array<int, T>}
+     */
+    private function applyCovered(array $shown, array $points, array $hidden): array
+    {
+        if ($hidden === []) {
+            return [$shown, $points];
+        }
+
+        $count = count($shown);
+
+        for ($number = 0; $number < $count; $number++) {
+            if (! isset($hidden[$number])) {
+                continue;
+            }
+
+            $end = $number;
+
+            while (isset($hidden[$end + 1])) {
+                $end++;
+            }
+
+            $target = $points[$end + 1] ?? $points[$number];
+
+            for ($middle = $number; $middle <= $end; $middle++) {
+                $shown[$middle] = '0';
+
+                if ($middle > $number) {
+                    $points[$middle] = $target;
+                }
+            }
+
+            $number = $end;
+        }
+
+        return [$shown, $points];
     }
 
     /**
@@ -683,12 +830,13 @@ final readonly class SvgService
         }
 
         [$values, $keyTimes] = $this->getChanges($values, $keyTimes);
-        $smoothing = $discrete
-            ? ' calcMode="discrete"'
-            : sprintf(' calcMode="spline" keySplines="%s"', implode(';', array_fill(0, count($values) - 1, '.4 0 .2 1')));
+        // Движение линейное: у SMIL нет общей кривой разгона и торможения,
+        // её пришлось бы писать на каждый отрезок каждой анимации — это пятая
+        // часть всего файла. Линейная интерполяция — поведение по умолчанию.
+        $smoothing = $discrete ? ' calcMode="discrete"' : '';
 
         return sprintf(
-            '<%s attributeName="%s"%s dur="%ss" values="%s" keyTimes="%s"%s repeatCount="%s" fill="freeze"/>',
+            '<%s attributeName="%s"%s dur="%ss" values="%s" keyTimes="%s"%s%s fill="freeze"/>',
             $tag,
             $attribute,
             $tag === 'animateTransform' ? ' type="translate"' : '',
@@ -696,7 +844,8 @@ final readonly class SvgService
             implode(';', $values),
             implode(';', array_map(self::moment(...), $keyTimes)),
             $smoothing,
-            $repeat ? 'indefinite' : '1',
+            // Один раз — поведение по умолчанию, писать его незачем.
+            $repeat ? ' repeatCount="indefinite"' : '',
         );
     }
 
@@ -779,14 +928,25 @@ final readonly class SvgService
             . 'svg{--paper:#1f1e1d;--line:#e8e6dc;--edge:#6b6862;--half:#d6a354}'
             . '}'
             . '</style>%s</svg>',
-            self::number($x),
-            self::number($y),
-            self::number($width),
-            self::number($height),
-            self::number($width),
-            self::number($height),
+            self::coord($x),
+            self::coord($y),
+            self::coord($width),
+            self::coord($height),
+            self::coord($width),
+            self::coord($height),
             $body,
         );
+    }
+
+    /**
+     * Координата — целым пикселем: полпикселя глазу не видно, а каждая
+     * цифра повторяется в записи пути сотни тысяч раз.
+     */
+    private static function coord(float $value): string
+    {
+        $result = (string) (int) round($value);
+
+        return $result === '-0' ? '0' : $result;
     }
 
     private static function number(float $value): string

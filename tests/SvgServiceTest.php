@@ -80,7 +80,8 @@ final class SvgServiceTest extends AbstractTestCase
         $first = (float) explode(',', $values[0])[0];
         $last = (float) explode(',', $values[count($values) - 1])[0];
 
-        self::assertEqualsWithDelta(0.4, $last / $first, 1.0e-6);
+        // Координаты пишутся целыми пикселями.
+        self::assertEqualsWithDelta(0.4, $last / $first, 1 / abs($first));
     }
 
     /**
@@ -154,7 +155,8 @@ final class SvgServiceTest extends AbstractTestCase
             $points[] = new Point2D((float) $matches[1], (float) $matches[2]);
         }
 
-        self::assertEqualsWithDelta($radius * $gap, self::getMinVertexDistance($points), 0.05);
+        // Координаты пишутся целыми пикселями: до пикселя на обе вершины.
+        self::assertEqualsWithDelta($radius * $gap, self::getMinVertexDistance($points), 1.0);
     }
 
     /**
@@ -274,12 +276,10 @@ final class SvgServiceTest extends AbstractTestCase
         $svg = $this->getSvgService()->animate([$this->scene($this->square()), $this->scene($this->square(40))]);
         $document = $this->parse($svg);
 
+        // Один проход — поведение по умолчанию, repeatCount не пишется.
         self::assertStringNotContainsString('indefinite', $svg, 'Рассказ не должен повторяться.');
-        self::assertNotSame([], $this->all($document, '//svg:animate/@repeatCount'));
-
-        foreach ($this->all($document, '//svg:animate/@repeatCount') as $count) {
-            self::assertSame('1', $count);
-        }
+        self::assertSame([], $this->all($document, '//svg:animate/@repeatCount'));
+        self::assertNotSame([], $this->all($document, '//svg:animate/@fill'));
 
         foreach ($this->all($document, '//svg:animate/@fill') as $fill) {
             self::assertSame('freeze', $fill, 'Последний кадр должен остаться на экране.');

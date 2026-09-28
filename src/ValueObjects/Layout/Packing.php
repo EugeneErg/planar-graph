@@ -122,15 +122,30 @@ final readonly class Packing
             return $sizes[$arena] = $home === null ? null : [.0, .0, $home];
         }
 
+        // Пустой стол с одним куском: кусок и лежит посередине.
+        if ($home === null && count($circles) === 1) {
+            [$ox, $oy, $radius] = reset($circles);
+            $rings[$arena][(string) key($circles)] = [-$ox, -$oy];
+
+            return $sizes[$arena] = [.0, .0, $radius];
+        }
+
         $radii = array_map(static fn (array $circle): float => $circle[2], $circles);
         $parts = $home === null ? [] : [[.0, .0, $home]];
 
-        foreach ($this->getShells($radii, $home ?? .0) as [$inner, $shell]) {
+        $inner = $home ?? .0;
+
+        foreach ($this->getShells($radii, $home ?? .0) as [, $shell]) {
+            $outer = $inner;
+
             foreach ($this->getShellPlaces($arena, $shell, $radii, $inner) as $child => $at) {
                 [$ox, $oy, $radius] = $circles[$child];
                 $rings[$arena][$child] = [$at[0] - $ox, $at[1] - $oy];
                 $parts[] = [$at[0], $at[1], $radius];
+                $outer = max($outer, hypot($at[0], $at[1]) + $radius);
             }
+
+            $inner = $outer;
         }
 
         return $sizes[$arena] = $this->getEnclosing($parts);
@@ -195,19 +210,26 @@ final readonly class Packing
     private function getShellPlaces(string $arena, array $shell, array $radii, float $inner): array
     {
         $children = $this->getAround($arena, $shell);
-        $distances = [];
-
-        foreach ($children as $child) {
-            $distances[$child] = $inner + $this->gap + $radii[$child];
-        }
-
-        $sectors = $this->getSectors($radii, $distances);
-        $angles = [];
-        $angle = .0;
+        $count = count($children);
+        // Слой — правильный многоугольник: три поля — треугольник, четыре —
+        // квадрат. Все на одном расстоянии: не ближе к середине, чем позволяет
+        // каждое, и так, чтобы соседи не налезали друг на друга.
+        $distance = .0;
 
         foreach ($children as $number => $child) {
-            $angle += $number === 0 ? .0 : ($sectors[$children[$number - 1]] + $sectors[$child]) / 2;
-            $angles[$child] = $angle;
+            $distance = max($distance, $inner + $this->gap + $radii[$child]);
+
+            if ($count > 1) {
+                $next = $children[($number + 1) % $count];
+                $distance = max($distance, ($radii[$child] + $radii[$next] + $this->gap) / (2 * sin(M_PI / $count)));
+            }
+        }
+
+        $distances = array_fill_keys($children, $distance);
+        $angles = [];
+
+        foreach ($children as $number => $child) {
+            $angles[$child] = 2 * M_PI * $number / $count;
         }
 
         $x = .0;
@@ -288,25 +310,6 @@ final readonly class Packing
         }
 
         return array_merge(array_slice($list, $start), array_slice($list, 0, $start));
-    }
-
-    /**
-     * Сектор каждого ребёнка: он сам и по половине зазора с боков.
-     *
-     * @param array<string, float> $radii
-     * @param array<string, float> $distances
-     *
-     * @return array<string, float>
-     */
-    private function getSectors(array $radii, array $distances): array
-    {
-        $result = [];
-
-        foreach ($distances as $child => $distance) {
-            $result[$child] = 2 * asin(min(1.0, ($radii[$child] + $this->gap / 2) / $distance));
-        }
-
-        return $result;
     }
 
     /**

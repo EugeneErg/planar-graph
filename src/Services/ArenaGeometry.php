@@ -114,9 +114,6 @@ final class ArenaGeometry
     /** @var array<int, Point2D> та же укладка, расслабленная */
     private array $relaxed = [];
 
-    /** @var array<string, array<string, array{Point2D, float}>> кусок => отложенное поле => где оно ждёт и какого размера */
-    private array $waiting = [];
-
     /** @var array<string, string[]> кусок => арены его полей */
     private array $fields = [];
 
@@ -155,6 +152,9 @@ final class ArenaGeometry
      *      За ними ничего нет: контур — граница всей ветви.
      */
     private array $closed = [];
+
+    /** @var array<string, int[]|null> арена => обход, который запрут на ней следующим */
+    private array $upcoming = [];
 
     /** @var array<string, int[]> арена => её контур по порядку */
     private array $contours = [];
@@ -231,7 +231,6 @@ final class ArenaGeometry
         $this->orders = [];
         $this->locks = [];
         $this->sides = [];
-        $this->waiting = [];
         $this->edges = [self::ROOT => []];
 
         foreach ($graph instanceof Graph ? $graph->edges : [] as $edge) {
@@ -246,10 +245,14 @@ final class ArenaGeometry
         $lanes = [];
 
         foreach ($step->children as $lane) {
-            $lanes[] = new PlacementLane(
-                $lane->arena,
-                array_map(fn (Step $child): Placement => $this->placeStep($child, $lane->arena), $lane->steps),
-            );
+            $placed = [];
+
+            foreach ($lane->steps as $number => $child) {
+                $this->upcoming[$lane->arena] = $this->getUpcomingLock(array_slice($lane->steps, $number + 1));
+                $placed[] = $this->placeStep($child, $lane->arena);
+            }
+
+            $lanes[] = new PlacementLane($lane->arena, $placed);
         }
 
         $action = $step->action;
@@ -269,8 +272,15 @@ final class ArenaGeometry
         }
 
         if ($action instanceof Cut) {
-            // Ответ получен: вопроса больше нет, и арена возвращается домой.
+            // Ответ получен: этот вопрос снят. Если следом на той же арене
+            // будет следующий, остаток сразу ложится под него: одни
+            // запертые вершины сменяются другими, а не «домой и обратно» —
+            // иначе арена гармошкой сжимается и снова разжимается.
             unset($this->locks[$arena], $this->sides[$arena]);
+
+            if (($this->upcoming[$arena] ?? null) !== null) {
+                $this->locks[$arena] = $this->orient($this->upcoming[$arena]);
+            }
 
             if ($action->walk !== null) {
                 $this->orders[$action->arena] = $this->orient($action->walk);
@@ -331,7 +341,9 @@ final class ArenaGeometry
             $action instanceof Relax => $this->getFramePlaces($arena, $this->relaxed),
             $action instanceof Straighten => $this->getFramePlaces($arena, $this->straight),
             $action instanceof Cover => $this->getCoverPlaces($action, $arena),
-            $action instanceof Postpone => $this->getPostponePlaces($action, $arena),
+            // Отложенное поле никуда не едет: оно просто выделяется там, где
+            // лежит, — в буфере.
+            $action instanceof Postpone => [],
             default => null,
         };
 
@@ -366,8 +378,7 @@ final class ArenaGeometry
                 $action instanceof Build => (string) $name === $action->arena ? $arena : $arena . self::ASIDE,
                 $action instanceof Relax,
                 $action instanceof Straighten,
-                $action instanceof Cover,
-                $action instanceof Postpone => $arena,
+                $action instanceof Cover => $arena,
                 $action instanceof Glue => $action->arena,
                 $action instanceof Open => $action->arena,
                 default => (string) $name,
@@ -382,10 +393,48 @@ final class ArenaGeometry
     }
 
     /**
+     * Обход, который запрут следующим, если до него на арене ничего, кроме
+     * разбора отрезанного, не происходит.
+     *
+     * @param Step[] $steps что идёт на дорожке дальше
+     *
+     * @return int[]|null
+     */
+    private function getUpcomingLock(array $steps): ?array
+    {
+        foreach ($steps as $step) {
+            if ($step->action instanceof Lock && $step->action->walk) {
+                return $step->action->vertexes;
+            }
+
+            if ($step->children === []) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Остаток становится последней частью: у арены просто новое имя.
      */
     private function rename(string $from, string $to): void
     {
+        // Клубок, от которого отделились несвязные куски, — не кусок, а стол.
+        // Последний кусок получает своё имя и ложится на стол рядом с
+        // остальными, а не становится их родителем: иначе чужие куски
+        // лежали бы на одном кольце с его собственными полями и ветвями.
+        if ($from === self::ROOT) {
+            $this->arenas[$to] = $this->arenas[$from];
+            $this->sizes[$to] = $this->sizes[$from];
+            $this->born[$to] = $this->born[$from];
+            $this->edges[$to] = $this->edges[$from] ?? [];
+            $this->parents[$to] = $from;
+            $this->arenas[$from] = [];
+
+            return;
+        }
+
         $this->aliases[$from] = $to;
         $this->arenas[$to] = $this->arenas[$from];
         $this->sizes[$to] = $this->sizes[$from];
@@ -1114,7 +1163,6 @@ final class ArenaGeometry
      */
     private function getBuildPlaces(Build $build, string $part): array
     {
-        unset($this->waiting[$part][$build->arena]);
         $result = [$build->arena => $this->getDrawn($build->arena, $part, $this->drawing)];
         $aside = $part . self::ASIDE;
 
@@ -1165,90 +1213,10 @@ final class ArenaGeometry
         $result = [];
 
         foreach (array_keys($cover->fields) as $arena) {
-            unset($this->waiting[$part][(string) $arena]);
             $result[(string) $arena] = $this->getDrawn((string) $arena, $part, $this->drawing);
         }
 
         return $result;
-    }
-
-    /**
-     * Отложенное поле ждёт у края укладки, напротив ребра, над которым его
-     * отложили; отложенные над одним ребром встают друг за другом.
-     *
-     * @return array<string, array<int, Point2D>>
-     */
-    private function getPostponePlaces(Postpone $postpone, string $part): array
-    {
-        [$origin, $scale] = $this->getFrame($part);
-        $center = $this->centers[$part] ?? new Point2D();
-        $pointA = $this->drawing[$postpone->vertexA] ?? $origin;
-        $pointB = $this->drawing[$postpone->vertexB] ?? $origin;
-        $middle = [($pointA->x + $pointB->x) / 2 - $origin->x, ($pointA->y + $pointB->y) / 2 - $origin->y];
-        $length = hypot(...$middle);
-        $direction = $length < GeometryService::EPSILON ? [.0, -1.0] : [$middle[0] / $length, $middle[1] / $length];
-        $outer = .0;
-
-        foreach ($this->firstWalks[$part] ?? [] as $vertex) {
-            $point = $this->drawing[$vertex] ?? $origin;
-            $outer = max($outer, hypot($point->x - $origin->x, $point->y - $origin->y) * $scale);
-        }
-
-        $present = $this->arenas[$postpone->arena] ?? [];
-        $order = array_values(array_unique(array_merge(
-            array_values(array_intersect($this->orders[$postpone->arena] ?? [], $present)),
-            $present,
-        )));
-        $radius = $this->place->getPieceRadius(count($order), self::UNIT);
-        $spot = $this->getWaitingSpot($part, $postpone->arena, $center, $direction, $outer + self::CLEARANCE + $radius, $radius);
-        $result = $this->place->getWheel($order, $spot, $radius);
-        $this->reachAround($part, $result);
-
-        return [$postpone->arena => $result];
-    }
-
-    /**
-     * Место в очереди у края укладки: как можно ближе к своему направлению,
-     * вплотную к краю, но не поверх того, что уже ждёт. Если рядом места
-     * нет, — по краю в обе стороны, а потом дальше от края.
-     *
-     * @param array{float, float} $direction
-     */
-    private function getWaitingSpot(string $part, string $arena, Point2D $center, array $direction, float $distance, float $radius): Point2D
-    {
-        $base = atan2($direction[0], -$direction[1]);
-        $taken = $this->waiting[$part] ?? [];
-        unset($taken[$arena]);
-        $spot = $this->place->getOnAngle($center, $distance, $base);
-
-        for ($ring = 0; $ring < 20; $ring++) {
-            $far = $distance + $ring * (2 * $radius + self::CLEARANCE);
-
-            for ($step = 0; $step <= 36; $step++) {
-                foreach (array_unique([$step, -$step]) as $side) {
-                    $candidate = $this->place->getOnAngle($center, $far, $base + $side * M_PI / 36);
-                    $free = true;
-
-                    foreach ($taken as [$point, $size]) {
-                        if (hypot($candidate->x - $point->x, $candidate->y - $point->y) < $radius + $size + self::CLEARANCE) {
-                            $free = false;
-
-                            break;
-                        }
-                    }
-
-                    if ($free) {
-                        $this->waiting[$part][$arena] = [$candidate, $radius];
-
-                        return $candidate;
-                    }
-                }
-            }
-        }
-
-        $this->waiting[$part][$arena] = [$spot, $radius];
-
-        return $spot;
     }
 
     /**
